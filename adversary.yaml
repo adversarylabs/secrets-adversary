@@ -7,6 +7,10 @@ triggers:
   files_changed:
     - "**/*"
 
+detection:
+  files:
+    - "**/*"
+
 runtime:
   name: node
   version: "22"
