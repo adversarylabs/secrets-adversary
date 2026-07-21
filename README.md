@@ -16,3 +16,7 @@ npm test
 adversary validate .
 adversary pack --check .
 ```
+
+## Automatic detection
+
+`adversary auto` selects the Secrets adversary for any changed repository file because committed credentials can appear anywhere.
