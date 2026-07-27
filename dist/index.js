@@ -16677,18 +16677,22 @@ async function applyModelSecretsReview(ctx, output, evidenceById, staticSeveriti
   ctx.review.assessment({ risk, summary: output.assessment.summary });
   const blocking = staticSeverities.some((s) => rank(s) >= 2) || modelSevs.some((s) => rank(s) >= 2);
   const ship = output.ship && !blocking;
-  let concern = staticPrimaryConcern;
-  const top = [...output.observations].sort((a, b) => rank(b.severity) - rank(a.severity))[0];
-  for (const candidate of [top?.title, output.primaryConcern, staticPrimaryConcern]) {
-    if (!candidate) continue;
-    if (isOpinionConcernPhrase(candidate)) {
-      concern = requireOpinionConcern(candidate);
-      break;
-    }
-    try {
-      concern = (await ctx.model.concern({ text: candidate })).concern;
-      break;
-    } catch {
+  let concern;
+  if (!ship || blocking) {
+    const top = [...output.observations].filter((o) => rank(o.severity) >= 2).sort((a, b) => rank(b.severity) - rank(a.severity))[0];
+    for (const candidate of [top?.title, output.primaryConcern, staticPrimaryConcern]) {
+      if (!candidate || !/\S/.test(candidate) || candidate.trim().length < 4) continue;
+      if (/^[:\-\s.]+$/.test(candidate.trim())) continue;
+      try {
+        if (isOpinionConcernPhrase(candidate)) {
+          concern = requireOpinionConcern(candidate);
+          break;
+        }
+        concern = (await ctx.model.concern({ text: candidate })).concern;
+        if (concern && concern.trim().length >= 4 && !/^[:\-\s.]+$/.test(concern.trim())) break;
+        concern = void 0;
+      } catch {
+      }
     }
   }
   ctx.review.opinion(formatOpinion({ ship, ...concern ? { concern } : {}, change: ctx.change }));
@@ -16851,7 +16855,7 @@ function matchesGlob(path, glob) {
 
 // src/index.ts
 function createApp() {
-  const app = new Adversary({ name: "secrets", version: "0.0.7", review: { maximumFindings: 8 } });
+  const app = new Adversary({ name: "secrets", version: "0.0.8", review: { maximumFindings: 8 } });
   registerRules(app);
   app.rule("secrets.review", async (ctx) => analyzeRepository(ctx));
   return app;

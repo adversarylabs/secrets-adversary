@@ -208,18 +208,28 @@ async function applyModelSecretsReview(
   const blocking =
     staticSeverities.some((s) => rank(s) >= 2) || modelSevs.some((s) => rank(s) >= 2);
   const ship = output.ship && !blocking;
-  let concern: string | undefined = staticPrimaryConcern;
-  const top = [...output.observations].sort((a, b) => rank(b.severity) - rank(a.severity))[0];
-  for (const candidate of [top?.title, output.primaryConcern, staticPrimaryConcern]) {
-    if (!candidate) continue;
-    if (isOpinionConcernPhrase(candidate)) {
-      concern = requireOpinionConcern(candidate);
-      break;
+  // When shipping clean (or only low non-blocking notes), do not attach a follow-up
+  // concern — that produced broken copy like "Addressing : is the only improvement…".
+  let concern: string | undefined;
+  if (!ship || blocking) {
+    const top = [...output.observations]
+      .filter((o) => rank(o.severity) >= 2)
+      .sort((a, b) => rank(b.severity) - rank(a.severity))[0];
+    for (const candidate of [top?.title, output.primaryConcern, staticPrimaryConcern]) {
+      if (!candidate || !/\S/.test(candidate) || candidate.trim().length < 4) continue;
+      if (/^[:\-\s.]+$/.test(candidate.trim())) continue;
+      try {
+        if (isOpinionConcernPhrase(candidate)) {
+          concern = requireOpinionConcern(candidate);
+          break;
+        }
+        concern = (await ctx.model.concern({ text: candidate })).concern;
+        if (concern && concern.trim().length >= 4 && !/^[:\-\s.]+$/.test(concern.trim())) break;
+        concern = undefined;
+      } catch {
+        /* next candidate */
+      }
     }
-    try {
-      concern = (await ctx.model.concern({ text: candidate })).concern;
-      break;
-    } catch { /* next */ }
   }
   ctx.review.opinion(formatOpinion({ ship, ...(concern ? { concern } : {}), change: ctx.change }));
 
