@@ -1,6 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { type RuleContext } from "@adversarylabs/sdk";
+import { isLikelyFalsePositiveSecret } from "./false-positives.js";
 import { observationFor } from "./rules.js";
 import { runModelSecretsReview } from "./model-review.js";
 import { spec, type MatchExpression, type RuleSpec } from "./spec.js";
@@ -76,9 +77,13 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
 
   return matchingSources.flatMap((file) => {
     if (!match.requires.every((pattern) => test(file.source, pattern))) return [];
-    const location = locate(file.source, match.pattern);
-    if (location === undefined) return [];
-    return [{ rule, file: file.path, ...location, label: rule.title, data: { matchedPattern: match.pattern.pattern } }];
+    return locateAll(file.source, match.pattern).map((location) => ({
+      rule,
+      file: file.path,
+      ...location,
+      label: rule.title,
+      data: { matchedPattern: match.pattern.pattern },
+    }));
   });
 }
 
@@ -87,10 +92,33 @@ function test(source: string, expression: MatchExpression): boolean {
 }
 
 function locate(source: string, expression: MatchExpression): { line: number; snippet: string } | undefined {
-  const match = new RegExp(expression.pattern, expression.flags).exec(source);
-  if (match?.index === undefined) return undefined;
-  const line = source.slice(0, match.index).split(/\r?\n/).length;
-  return { line, snippet: source.split(/\r?\n/)[line - 1]?.trim().slice(0, 240) ?? "" };
+  return locateAll(source, expression)[0];
+}
+
+/** All non-false-positive matches for a content pattern, stable by line order. */
+function locateAll(source: string, expression: MatchExpression): { line: number; snippet: string }[] {
+  const flags = expression.flags.includes("g") ? expression.flags : `${expression.flags}g`;
+  const re = new RegExp(expression.pattern, flags);
+  const lines = source.split(/\r?\n/);
+  const out: { line: number; snippet: string }[] = [];
+  const seenLines = new Set<number>();
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source)) !== null) {
+    if (match.index === undefined) break;
+    // Avoid zero-length match infinite loops.
+    if (match[0] === "") {
+      re.lastIndex += 1;
+      continue;
+    }
+    const lineNumber = source.slice(0, match.index).split(/\r?\n/).length;
+    if (seenLines.has(lineNumber)) continue;
+    const lineText = lines[lineNumber - 1] ?? "";
+    const nearby = [lines[lineNumber - 2], lines[lineNumber], lines[lineNumber + 1]].filter(Boolean).join("\n");
+    if (isLikelyFalsePositiveSecret(match[0], lineText, nearby)) continue;
+    seenLines.add(lineNumber);
+    out.push({ line: lineNumber, snippet: lineText.trim().slice(0, 240) });
+  }
+  return out;
 }
 
 async function walk(root: string): Promise<string[]> {

@@ -16356,6 +16356,54 @@ function omitUndefined(value) {
 import { readFile as readFile2, readdir as readdir2 } from "node:fs/promises";
 import { join, sep } from "node:path";
 
+// src/false-positives.ts
+var FAKE_CONTEXT = /\b(?:fake\s+(?:secret|key|credential|token)|placeholder|dummy\s+(?:secret|key|credential|token|value)?|redact(?:ed|ion)?|saniti[sz]e|mask(?:ed|ing)?|not\s+(?:a\s+)?real|test\s+secret|for\s+testing\s+only|do\s+not\s+use|not\s+(?:a\s+)?live\s+(?:secret|key|credential))\b/i;
+var KNOWN_FAKE_AWS_KEYS = /* @__PURE__ */ new Set([
+  "AKIAIOSFODNN7EXAMPLE",
+  "AKIAXXXXXXXXXXXXXXXX",
+  "AKIA0000000000000000",
+  "AKIATESTTESTTESTTEST",
+  "AKIAAAAAAAAAAAAAAAAA"
+]);
+function isLikelyFalsePositiveSecret(match, line, nearby = "") {
+  const value = match.trim();
+  if (value === "") return true;
+  if (isAwsAccessKeyId(value)) {
+    if (KNOWN_FAKE_AWS_KEYS.has(value.toUpperCase())) return true;
+    if (isPlaceholderLikeToken(value.slice(4))) return true;
+  } else if (isPlaceholderLikeToken(value)) {
+    return true;
+  }
+  const context = `${line}
+${nearby}`;
+  if (FAKE_CONTEXT.test(context)) return true;
+  if (isRedactionReturnLine(line, value)) return true;
+  return false;
+}
+function isAwsAccessKeyId(value) {
+  return /^AKIA[0-9A-Z]{16}$/i.test(value);
+}
+function isPlaceholderLikeToken(value) {
+  const body = value.replace(/[^0-9A-Za-z]/g, "");
+  if (body.length < 8) return false;
+  const upper = body.toUpperCase();
+  const unique = new Set(upper).size;
+  if (unique <= 2) return true;
+  const placeholder = (upper.match(/[X0]/g) ?? []).length;
+  if (placeholder / upper.length >= 0.7) return true;
+  if (/(.)\1{7,}/i.test(upper)) return true;
+  if (/(?:EXAMPLE|SAMPLE|TESTKEY|FAKEKEY|PLACEHOLDER|REDACTED|YOURKEYHERE)/i.test(upper)) return true;
+  return false;
+}
+function isRedactionReturnLine(line, match) {
+  const quoted = match.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    `(?:return|=>|=)\\s*["'\`]${quoted}["'\`]`,
+    "i"
+  );
+  return re.test(line);
+}
+
 // src/spec.ts
 var spec = {
   "id": "secrets",
@@ -16728,19 +16776,43 @@ function evaluate(rule, sources, allPaths) {
   }
   return matchingSources.flatMap((file) => {
     if (!match.requires.every((pattern) => test(file.source, pattern))) return [];
-    const location = locate(file.source, match.pattern);
-    if (location === void 0) return [];
-    return [{ rule, file: file.path, ...location, label: rule.title, data: { matchedPattern: match.pattern.pattern } }];
+    return locateAll(file.source, match.pattern).map((location) => ({
+      rule,
+      file: file.path,
+      ...location,
+      label: rule.title,
+      data: { matchedPattern: match.pattern.pattern }
+    }));
   });
 }
 function test(source, expression) {
   return new RegExp(expression.pattern, expression.flags).test(source);
 }
 function locate(source, expression) {
-  const match = new RegExp(expression.pattern, expression.flags).exec(source);
-  if (match?.index === void 0) return void 0;
-  const line = source.slice(0, match.index).split(/\r?\n/).length;
-  return { line, snippet: source.split(/\r?\n/)[line - 1]?.trim().slice(0, 240) ?? "" };
+  return locateAll(source, expression)[0];
+}
+function locateAll(source, expression) {
+  const flags = expression.flags.includes("g") ? expression.flags : `${expression.flags}g`;
+  const re = new RegExp(expression.pattern, flags);
+  const lines = source.split(/\r?\n/);
+  const out = [];
+  const seenLines = /* @__PURE__ */ new Set();
+  let match;
+  while ((match = re.exec(source)) !== null) {
+    if (match.index === void 0) break;
+    if (match[0] === "") {
+      re.lastIndex += 1;
+      continue;
+    }
+    const lineNumber = source.slice(0, match.index).split(/\r?\n/).length;
+    if (seenLines.has(lineNumber)) continue;
+    const lineText = lines[lineNumber - 1] ?? "";
+    const nearby = [lines[lineNumber - 2], lines[lineNumber], lines[lineNumber + 1]].filter(Boolean).join("\n");
+    if (isLikelyFalsePositiveSecret(match[0], lineText, nearby)) continue;
+    seenLines.add(lineNumber);
+    out.push({ line: lineNumber, snippet: lineText.trim().slice(0, 240) });
+  }
+  return out;
 }
 async function walk2(root) {
   const files = [];
@@ -16779,7 +16851,7 @@ function matchesGlob(path, glob) {
 
 // src/index.ts
 function createApp() {
-  const app = new Adversary({ name: "secrets", version: "0.0.6", review: { maximumFindings: 8 } });
+  const app = new Adversary({ name: "secrets", version: "0.0.7", review: { maximumFindings: 8 } });
   registerRules(app);
   app.rule("secrets.review", async (ctx) => analyzeRepository(ctx));
   return app;
