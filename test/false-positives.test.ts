@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { isLikelyFalsePositiveSecret, isPlaceholderLikeToken } from "../src/false-positives.ts";
 import { createApp } from "../src/index.ts";
-
-const fixture = (name: string) => new URL(`../fixtures/${name}`, import.meta.url).pathname;
-const review = (name: string) => createApp().run({ input: { source: { path: fixture(name) } } });
 
 test("placeholder AWS masks are false positives", () => {
   assert.equal(isPlaceholderLikeToken("XXXXXXXXXXXXXXXX"), true);
@@ -31,15 +31,29 @@ test("placeholder AWS masks are false positives", () => {
 });
 
 test("aws-key clean fixture includes redaction masks without findings", async () => {
-  const output = await review("rules/aws-key/clean");
-  assert.equal(
-    output.findings.some((finding) => finding.ruleId === "secrets.aws-key"),
-    false,
-    `unexpected aws-key findings: ${JSON.stringify(output.findings, null, 2)}`,
-  );
+  const dir = await mkdtemp(join(tmpdir(), "aws-clean-"));
+  try {
+    await writeFile(join(dir, "config.env"), "AWS_ACCESS_KEY_ID=AKIAXXXXXXXXXXXXXXXX\n");
+    const output = await createApp().run({ input: { source: { path: dir } } });
+    assert.equal(
+      output.findings.some((finding) => finding.ruleId === "secrets.aws-key" || finding.ruleId === "secrets.aws.access-key-id"),
+      false,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("aws-key still flags a realistic committed access key id", async () => {
-  const output = await review("rules/aws-key/vulnerable");
-  assert.equal(output.findings.some((finding) => finding.ruleId === "secrets.aws-key"), true);
+  const dir = await mkdtemp(join(tmpdir(), "aws-vuln-"));
+  try {
+    await writeFile(join(dir, "config.env"), "AWS_ACCESS_KEY_ID=AKIAABCDEFGHIJKLMNOP\n");
+    const output = await createApp().run({ input: { source: { path: dir } } });
+    assert.equal(
+      output.findings.some((finding) => finding.ruleId === "secrets.aws-key" || finding.ruleId === "secrets.aws.access-key-id"),
+      true,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
