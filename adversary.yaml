@@ -1,5 +1,5 @@
 name: security/secrets
-version: 0.0.8
+version: 0.0.9
 description: Scans repository text for high-confidence committed credentials and private keys.
 
 triggers:
