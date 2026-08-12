@@ -25,7 +25,7 @@ Highlights:
 | Git forges | GitHub classic and fine-grained PATs |
 | Keys | OpenSSH / PEM private key blocks |
 | SaaS | Stripe live keys, Slack tokens, SendGrid, npm tokens |
-| Config | DB connection strings; committed dotenv with real secrets; K8s Secret manifests with data |
+| Config | DB connection strings; committed dotenv with real secrets; K8s Secret manifests with data; known Symfony defaults |
 
 ### Ownership boundaries
 
