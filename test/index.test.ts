@@ -113,6 +113,16 @@ const CASES: Array<{ id: string; vulnerable: () => Record<string, string>; clean
     }),
   },
   {
+    id: "secrets.symfony.default-secret",
+    vulnerable: () => ({
+      "parameters.yml": `parameters:\n  secret: ${parts("This", "EzPlatformTokenIsNotSoSecret_PleaseChangeIt")}\n`,
+    }),
+    clean: () => ({
+      "parameters.yml": "parameters:\n  secret: ${APP_SECRET}\n",
+      ".env.example": "APP_SECRET=ThisTokenIsOnlyAnExample\n",
+    }),
+  },
+  {
     id: "secrets.slack.token",
     // split so push protection does not see a full xoxb- token literal
     vulnerable: () => ({
@@ -140,6 +150,19 @@ const CASES: Array<{ id: string; vulnerable: () => Record<string, string>; clean
     clean: () => ({ "sendgrid.env": "SENDGRID_API_KEY=\n" }),
   },
 ];
+
+test("detects both known Symfony default secrets", async () => {
+  const defaults = [
+    parts("This", "TokenIsNotSoSecretChangeIt"),
+    parts("This", "EzPlatformTokenIsNotSoSecret_PleaseChangeIt"),
+  ];
+  for (const value of defaults) {
+    await withFixture({ "parameters.yml": `parameters:\n  secret: ${value}\n` }, async (dir) => {
+      const output = await review(dir);
+      assert.equal(output.findings.some((finding) => finding.ruleId === "secrets.symfony.default-secret"), true);
+    });
+  }
+});
 
 test("every P0 secrets rule has vulnerable and clean coverage", async () => {
   for (const rule of CASES) {

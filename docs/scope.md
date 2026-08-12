@@ -14,6 +14,7 @@ Find high-confidence committed credentials and private keys in repository text.
 
 - API keys, tokens, private keys committed in tree
 - High-confidence secret material in files
+- Known framework default secrets that remain usable credential material
 
 ## Out of scope (not a miss for this adversary)
 

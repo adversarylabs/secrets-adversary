@@ -133,6 +133,17 @@ Regression entry: [`test/`](test/) including false-positive cases.
 
 ## High
 
+### `secrets.symfony.default-secret`
+
+| | |
+| --- | --- |
+| **What** | Known Symfony or eZ Platform default application secret |
+| **Why** | Public defaults remain usable signing material when deployments never replace them |
+| **Looks for** | Exact legacy `ThisTokenIsNotSoSecretChangeIt` and eZ Platform variant values |
+| **Stays quiet when** | Generic placeholders or deployment-specific generated values are used |
+| **Public examples** | [Trivy maintainer review](https://github.com/aquasecurity/trivy/pull/9892#discussion_r2597664195) |
+| **Remediation** | Generate a new high-entropy secret outside version control and invalidate artifacts signed with the old value |
+
 ### `secrets.dotenv.committed`
 
 | | |

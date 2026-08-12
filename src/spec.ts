@@ -328,6 +328,34 @@ export const spec = {
       }
     },
     {
+      "id": "secrets.symfony.default-secret",
+      "title": "Known Symfony default application secret",
+      "summary": "Known Symfony default application secret",
+      "category": "secrets",
+      "severity": "high",
+      "confidence": "high",
+      "whyItMatters": "Older Symfony and eZ Platform projects shipped public default signing secrets. Deployments that retain them let attackers forge values protected by the application secret.",
+      "impact": "Attackers can use the known signing material to forge trusted application data and, on affected legacy stacks, reach remote code execution.",
+      "recommendation": "Replace the default with a freshly generated high-entropy secret supplied outside version control, then invalidate artifacts signed with the old value.",
+      "complexity": "small",
+      "tags": [
+        "secrets",
+        "symfony",
+        "default-secret"
+      ],
+      "match": {
+        "kind": "content",
+        "files": [
+          "**/*"
+        ],
+        "pattern": {
+          "pattern": "\\bThis(?:TokenIsNotSoSecretChangeIt|EzPlatformTokenIsNotSoSecret_PleaseChangeIt)\\b",
+          "flags": "im"
+        },
+        "requires": []
+      }
+    },
+    {
       "id": "secrets.slack.token",
       "title": "Slack API token",
       "summary": "Slack API token",
