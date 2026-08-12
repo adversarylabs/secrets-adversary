@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { createAdversaryRunEnvelope } from "@adversarylabs/sdk";
 import { createApp } from "../src/index.ts";
+
+const execute = promisify(execFile);
 
 async function withFixture(
   files: Record<string, string>,
@@ -199,6 +203,42 @@ test("accepts a repository without secrets", async () => {
   assert.deepEqual(output.findings, []);
 });
 
+test("an unrelated edit does not surface a legacy direct secret", async () => {
+  const accessKey = parts("AKIA", "ABCDEFGHIJKLMNOP");
+  const root = await gitRepository({ "config.env": `AWS_ACCESS_KEY_ID=${accessKey}\n` });
+  try {
+    await writeFile(join(root, "config.env"), `AWS_ACCESS_KEY_ID=${accessKey}\n# unrelated documentation update\n`);
+
+    const output = await changedReview(root, ["config.env"]);
+    assert.equal(
+      output.findings.some((finding) =>
+        finding.ruleId === "secrets.aws.access-key-id" || finding.ruleId === "secrets.aws-key"),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a newly added file remains fully eligible for direct secret findings", async () => {
+  const root = await gitRepository({ "README.md": "# service\n" });
+  try {
+    await writeFile(
+      join(root, "config.env"),
+      `AWS_ACCESS_KEY_ID=${parts("AKIA", "ABCDEFGHIJKLMNOP")}\n`,
+    );
+
+    const output = await changedReview(root, ["config.env"]);
+    assert.equal(
+      output.findings.some((finding) =>
+        finding.ruleId === "secrets.aws.access-key-id" || finding.ruleId === "secrets.aws-key"),
+      true,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("deterministic envelope", async () => {
   await withFixture(CASES[0]!.vulnerable(), async (dir) => {
     const first = await review(dir, true);
@@ -208,3 +248,32 @@ test("deterministic envelope", async () => {
     assert.equal(envelope.protocolVersion, 1);
   });
 });
+
+async function changedReview(root: string, changedFiles: string[]) {
+  return createApp().run({
+    input: {
+      source: { path: root },
+      change: {
+        type: "diff",
+        base_ref: "HEAD",
+        head_ref: "WORKTREE",
+        scan_mode: "changed",
+        changed_files: changedFiles,
+      },
+    },
+    includeRawObservations: true,
+  });
+}
+
+async function gitRepository(files: Record<string, string>): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "secrets-git-"));
+  await execute("git", ["init", "--quiet", root]);
+  await execute("git", ["-C", root, "config", "user.email", "tests@example.com"]);
+  await execute("git", ["-C", root, "config", "user.name", "Tests"]);
+  for (const [path, content] of Object.entries(files)) {
+    await writeFile(join(root, path), content);
+  }
+  await execute("git", ["-C", root, "add", "."]);
+  await execute("git", ["-C", root, "commit", "--quiet", "-m", "baseline"]);
+  return root;
+}
