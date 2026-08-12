@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { join, sep } from "node:path";
+import { promisify } from "node:util";
 import { type RuleContext } from "@adversarylabs/sdk";
 import { isLikelyFalsePositiveSecret } from "./false-positives.js";
 import { observationFor } from "./rules.js";
@@ -8,8 +10,14 @@ import { spec, type MatchExpression, type RuleSpec } from "./spec.js";
 
 const SKIPPED = new Set([".adversary", ".git", ".hg", ".next", ".svn", "coverage", "dist", "node_modules", "target", "vendor"]);
 const MAX_FILES = 5000;
+const execute = promisify(execFile);
 
-interface SourceFile { path: string; source: string }
+interface SourceFile {
+  path: string;
+  source: string;
+  changedLines: Set<number>;
+  status: "added" | "modified" | "repository";
+}
 interface Detection { rule: RuleSpec; file: string; line: number; snippet: string; label: string; data: Record<string, unknown> }
 
 export async function analyzeRepository(ctx: RuleContext): Promise<void> {
@@ -21,7 +29,19 @@ export async function analyzeRepository(ctx: RuleContext): Promise<void> {
       spec.files.some((glob) => matchesGlob(path, glob)),
     limit: MAX_FILES,
   });
-  const sources: SourceFile[] = scoped.map((file) => ({ path: file.path, source: file.content }));
+  const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
+  const sources: SourceFile[] = [];
+  for (const file of scoped) {
+    const change = wholeTarget || file.status === "repository"
+      ? { changedLines: new Set<number>(), status: "repository" as const }
+      : await changedSource(ctx, file.path);
+    sources.push({
+      path: file.path,
+      source: file.content,
+      changedLines: change.changedLines,
+      status: change.status,
+    });
+  }
   ctx.summary.files_scanned = sources.length;
 
   const detections = spec.rules.flatMap((rule) => evaluate(rule, sources, allPaths));
@@ -75,14 +95,66 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
 
   return matchingSources.flatMap((file) => {
     if (!match.requires.every((pattern) => test(file.source, pattern))) return [];
-    return locateAll(file.source, match.pattern).map((location) => ({
-      rule,
-      file: file.path,
-      ...location,
-      label: rule.title,
-      data: { matchedPattern: match.pattern.pattern },
-    }));
+    return locateAll(file.source, match.pattern)
+      .filter((location) => directFindingEligible(file, location.line))
+      .map((location) => ({
+        rule,
+        file: file.path,
+        ...location,
+        label: rule.title,
+        data: { matchedPattern: match.pattern.pattern },
+      }));
   });
+}
+
+function directFindingEligible(file: SourceFile, line: number): boolean {
+  return file.status !== "modified" || file.changedLines.has(line);
+}
+
+async function changedSource(
+  ctx: RuleContext,
+  path: string,
+): Promise<Pick<SourceFile, "changedLines" | "status">> {
+  const base = ctx.change?.baseRef;
+  if (base === undefined || !(await existsAtRevision(ctx.repoPath, base, path))) {
+    return { changedLines: new Set<number>(), status: "added" };
+  }
+
+  const args = ["diff", "--unified=0", base];
+  const head = ctx.change?.headRef;
+  if (head !== undefined && !ctx.change?.worktree) args.push(head);
+  args.push("--", path);
+  const patch = await gitOutput(ctx.repoPath, args);
+  return { changedLines: changedLineNumbers(patch), status: "modified" };
+}
+
+async function existsAtRevision(repoPath: string, revision: string, path: string): Promise<boolean> {
+  try {
+    await execute("git", ["-C", repoPath, "cat-file", "-e", `${revision}:${path}`], {
+      maxBuffer: 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function gitOutput(repoPath: string, args: string[]): Promise<string> {
+  const result = await execute("git", ["-C", repoPath, ...args], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  return result.stdout;
+}
+
+function changedLineNumbers(patch: string): Set<number> {
+  const lines = new Set<number>();
+  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(match[1]);
+    const count = match[2] === undefined ? 1 : Number(match[2]);
+    for (let line = start; line < start + count; line += 1) lines.add(line);
+  }
+  return lines;
 }
 
 function test(source: string, expression: MatchExpression): boolean {

@@ -17036,8 +17036,10 @@ function omitUndefined(value) {
 }
 
 // src/analyze.ts
+import { execFile } from "node:child_process";
 import { readdir as readdir4 } from "node:fs/promises";
 import { join as join3, sep as sep2 } from "node:path";
+import { promisify } from "node:util";
 
 // src/false-positives.ts
 var FAKE_CONTEXT = /\b(?:fake\s+(?:secret|key|credential|token)|placeholder|dummy\s+(?:secret|key|credential|token|value)?|redact(?:ed|ion)?|saniti[sz]e|mask(?:ed|ing)?|not\s+(?:a\s+)?real|test\s+secret|for\s+testing\s+only|do\s+not\s+use|not\s+(?:a\s+)?live\s+(?:secret|key|credential))\b/i;
@@ -17768,13 +17770,24 @@ async function applyModelSecretsReview(ctx, output, evidenceById, staticSeveriti
 // src/analyze.ts
 var SKIPPED = /* @__PURE__ */ new Set([".adversary", ".git", ".hg", ".next", ".svn", "coverage", "dist", "node_modules", "target", "vendor"]);
 var MAX_FILES = 5e3;
+var execute = promisify(execFile);
 async function analyzeRepository(ctx) {
   const allPaths = await walk2(ctx.repoPath);
   const scoped = await ctx.loadInScopeSources({
     include: (path) => !path.split("/").some((segment) => SKIPPED.has(segment)) && spec.files.some((glob) => matchesGlob(path, glob)),
     limit: MAX_FILES
   });
-  const sources = scoped.map((file) => ({ path: file.path, source: file.content }));
+  const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
+  const sources = [];
+  for (const file of scoped) {
+    const change = wholeTarget || file.status === "repository" ? { changedLines: /* @__PURE__ */ new Set(), status: "repository" } : await changedSource(ctx, file.path);
+    sources.push({
+      path: file.path,
+      source: file.content,
+      changedLines: change.changedLines,
+      status: change.status
+    });
+  }
   ctx.summary.files_scanned = sources.length;
   const detections = spec.rules.flatMap((rule) => evaluate(rule, sources, allPaths));
   detections.sort((a, b) => a.rule.id.localeCompare(b.rule.id) || a.file.localeCompare(b.file) || a.line - b.line || a.label.localeCompare(b.label));
@@ -17822,7 +17835,7 @@ function evaluate(rule, sources, allPaths) {
   }
   return matchingSources.flatMap((file) => {
     if (!match.requires.every((pattern) => test(file.source, pattern))) return [];
-    return locateAll(file.source, match.pattern).map((location) => ({
+    return locateAll(file.source, match.pattern).filter((location) => directFindingEligible(file, location.line)).map((location) => ({
       rule,
       file: file.path,
       ...location,
@@ -17830,6 +17843,47 @@ function evaluate(rule, sources, allPaths) {
       data: { matchedPattern: match.pattern.pattern }
     }));
   });
+}
+function directFindingEligible(file, line) {
+  return file.status !== "modified" || file.changedLines.has(line);
+}
+async function changedSource(ctx, path) {
+  const base = ctx.change?.baseRef;
+  if (base === void 0 || !await existsAtRevision(ctx.repoPath, base, path)) {
+    return { changedLines: /* @__PURE__ */ new Set(), status: "added" };
+  }
+  const args = ["diff", "--unified=0", base];
+  const head = ctx.change?.headRef;
+  if (head !== void 0 && !ctx.change?.worktree) args.push(head);
+  args.push("--", path);
+  const patch = await gitOutput(ctx.repoPath, args);
+  return { changedLines: changedLineNumbers(patch), status: "modified" };
+}
+async function existsAtRevision(repoPath, revision, path) {
+  try {
+    await execute("git", ["-C", repoPath, "cat-file", "-e", `${revision}:${path}`], {
+      maxBuffer: 1024 * 1024
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function gitOutput(repoPath, args) {
+  const result = await execute("git", ["-C", repoPath, ...args], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024
+  });
+  return result.stdout;
+}
+function changedLineNumbers(patch) {
+  const lines = /* @__PURE__ */ new Set();
+  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
+    const start = Number(match[1]);
+    const count = match[2] === void 0 ? 1 : Number(match[2]);
+    for (let line = start; line < start + count; line += 1) lines.add(line);
+  }
+  return lines;
 }
 function test(source, expression) {
   return new RegExp(expression.pattern, expression.flags).test(source);
