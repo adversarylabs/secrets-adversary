@@ -444,6 +444,7 @@ test("deterministic envelope", async () => {
     assert.deepEqual(second, first);
     const envelope = JSON.parse(JSON.stringify(createAdversaryRunEnvelope(first)));
     assert.equal(envelope.protocolVersion, 1);
+    assert.equal(envelope.result.adversary.version, "0.0.16");
   });
 });
 
