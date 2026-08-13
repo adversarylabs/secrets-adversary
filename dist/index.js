@@ -17874,23 +17874,30 @@ function evaluate(rule, sources, allPaths) {
 function findQueryCredentialHttpErrors(rule, file) {
   const detections = [];
   for (const block of findFunctionBlocks(file.source)) {
+    const executable = maskPythonNonCode(block.body);
     const request = /\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.(get|post|put|patch|delete|head|request)\s*\(/g;
-    for (const match of block.body.matchAll(request)) {
+    for (const match of executable.matchAll(request)) {
       if (match.index === void 0 || match[1] === void 0 || match[2] === void 0) continue;
-      if (!hasRequestsReceiverProof(file.source, block, match[2], match.index)) continue;
-      const opening = block.body.indexOf("(", match.index + match[0].length - 1);
-      const call = balancedSource(block.body, opening, "(", ")");
+      if (!hasRequestsReceiverProof(maskPythonNonCode(file.source), block, match[2], match.index)) continue;
+      const opening = executable.indexOf("(", match.index + match[0].length - 1);
+      const call = balancedSource(executable, opening, "(", ")");
       if (call === void 0) continue;
-      const credential = credentialQueryMapping(block.body, match.index, opening, call.source);
+      const credential = credentialQueryMapping(
+        block.body,
+        executable,
+        match.index,
+        opening,
+        block.body.slice(opening, call.end)
+      );
       if (credential === void 0) continue;
       const response = match[1];
-      const afterCall = block.body.slice(call.end);
+      const afterCall = executable.slice(call.end);
       const raise = new RegExp(`\\b${escapeRegExp(response)}\\.raise_for_status\\s*\\(\\s*\\)`).exec(afterCall);
       if (raise?.index === void 0) continue;
       const between = afterCall.slice(0, raise.index);
       if (new RegExp(`^\\s*${escapeRegExp(response)}\\s*=`, "m").test(between)) continue;
       const raiseIndex = call.end + raise.index;
-      if (hasSanitizedHttpErrorHandler(block.body, raiseIndex)) continue;
+      if (isContainedBySafeHttpErrorHandler(block.body, executable, raiseIndex)) continue;
       const semanticIndexes = [credential.index, match.index, raiseIndex].map((index) => block.start + index);
       const semanticLines = semanticIndexes.map((index) => file.source.slice(0, index).split(/\r?\n/).length);
       const line = file.status === "modified" ? semanticLines.find((candidate) => file.changedLines.has(candidate)) : semanticLines[0];
@@ -17923,7 +17930,7 @@ function hasRequestsReceiverProof(fileSource, block, receiver, requestIndex) {
     "m"
   ).test(block.body.slice(0, requestIndex));
 }
-function credentialQueryMapping(body, requestIndex, callOpening, callSource) {
+function credentialQueryMapping(body, executable, requestIndex, callOpening, callSource) {
   const params = /\bparams\s*=\s*/g.exec(callSource);
   if (params?.index === void 0) return void 0;
   const valueStart = params.index + params[0].length;
@@ -17936,12 +17943,12 @@ function credentialQueryMapping(body, requestIndex, callOpening, callSource) {
   if (variable === void 0) return void 0;
   const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
   let selected;
-  for (const candidate of body.slice(0, requestIndex).matchAll(assignment)) selected = candidate;
+  for (const candidate of executable.slice(0, requestIndex).matchAll(assignment)) selected = candidate;
   if (selected?.index === void 0) return void 0;
-  const opening = body.indexOf("{", selected.index);
-  const mapping = balancedSource(body, opening, "{", "}");
+  const opening = executable.indexOf("{", selected.index);
+  const mapping = balancedSource(executable, opening, "{", "}");
   if (mapping === void 0 || mapping.end > requestIndex) return void 0;
-  return secretMappingEntry(mapping.source, opening);
+  return secretMappingEntry(body.slice(opening, mapping.end), opening);
 }
 function secretMappingEntry(source, sourceIndex) {
   const entry = /["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:\s*([^,}\n]+)/g;
@@ -17960,17 +17967,125 @@ function isSecretName(value) {
   if (/(?:^|_)(?:page|next|continuation|cursor)_token(?:_|$)/.test(normalized)) return false;
   return /(?:^|_)(?:api_key|access_key|private_key|access_token|auth_token|secret|password|passwd|credential|bearer|auth|token)(?:_|$)/.test(normalized);
 }
-function hasSanitizedHttpErrorHandler(body, raiseIndex) {
-  const before = body.slice(Math.max(0, raiseIndex - 1200), raiseIndex);
-  if (!/^\s*try\s*:\s*$/m.test(before)) return false;
-  const after = body.slice(raiseIndex, raiseIndex + 2e3);
-  const handler = /^\s*except\s+(?:requests\.)?(?:exceptions\.)?(?:HTTPError|RequestException)\b[^:]*:\s*\n((?:[ \\t]+[^\n]*(?:\n|$)){1,12})/m.exec(after)?.[1];
-  if (handler === void 0) return false;
-  if (!/^\s*raise\b/m.test(handler)) return true;
-  if (!/\bfrom\s+None\b/.test(handler)) return false;
-  if (/\bstr\s*\(|\braise\s*$/m.test(handler)) return false;
-  if (/\.(?:request|response)\.url\b/.test(handler) && !/urlsplit|urlparse|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler)) return false;
-  return /status_code|urlsplit|urlparse|\.path\b|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler);
+function isContainedBySafeHttpErrorHandler(body, executable, raiseIndex) {
+  const lines = executable.split(/\r?\n/);
+  const originalLines = body.split(/\r?\n/);
+  const offsets = lineOffsets(executable);
+  const raiseLine = lineIndexAt(offsets, raiseIndex);
+  const raiseIndent = indentation(lines[raiseLine] ?? "");
+  let tryLine = -1;
+  for (let index = raiseLine - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() === "") continue;
+    const indent = indentation(line);
+    if (indent >= raiseIndent || !/^\s*try\s*:\s*$/.test(line)) continue;
+    const containsRaise = lines.slice(index + 1, raiseLine + 1).every((nested) => nested.trim() === "" || indentation(nested) > indent);
+    if (containsRaise) {
+      tryLine = index;
+      break;
+    }
+  }
+  if (tryLine < 0) return false;
+  const tryIndent = indentation(lines[tryLine] ?? "");
+  let exceptLine = -1;
+  for (let index = raiseLine + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() === "") continue;
+    const indent = indentation(line);
+    if (indent < tryIndent) break;
+    if (indent === tryIndent) {
+      if (/^\s*except\s+(?:requests\.)?(?:exceptions\.)?(?:HTTPError|RequestException)\b/.test(originalLines[index] ?? "")) {
+        exceptLine = index;
+      }
+      break;
+    }
+  }
+  if (exceptLine < 0) return false;
+  let endLine = lines.length;
+  for (let index = exceptLine + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() !== "" && indentation(line) <= tryIndent) {
+      endLine = index;
+      break;
+    }
+  }
+  const handlerStart = offsets[exceptLine] ?? 0;
+  const handlerEnd = offsets[endLine] ?? executable.length;
+  const handler = body.slice(handlerStart, handlerEnd);
+  const handlerCode = executable.slice(handlerStart, handlerEnd);
+  const header = originalLines[exceptLine] ?? "";
+  const exceptionName = /\bas\s+([A-Za-z_]\w*)\s*:/.exec(header)?.[1];
+  if (exceptionName !== void 0 && new RegExp(`\\b(?:print|capture_exception|report_exception|record_exception|logger\\.(?:debug|info|warning|error|exception|critical))\\s*\\([^\\n]*\\b${escapeRegExp(exceptionName)}\\b`).test(handler)) {
+    return false;
+  }
+  if (/\blogger\.exception\s*\(|\bprint\s*\(|\bcapture_exception\s*\(|\breport_exception\s*\(|\brecord_exception\s*\(/.test(handler)) return false;
+  if (!/^\s*raise\b/m.test(handlerCode) && /^\s+(?:return\b[^\n]*|continue|break)\s*$/m.test(handlerCode)) {
+    if (exceptionName === void 0 || !new RegExp(`\\b${escapeRegExp(exceptionName)}\\b`).test(handler.slice(handler.indexOf("\n") + 1))) return true;
+  }
+  if (/^\s*raise\s*$/m.test(handlerCode)) return false;
+  if (!/^\s*raise\s+[A-Za-z_]\w*\s*\(/m.test(handlerCode) || !/\bfrom\s+None\b/.test(handlerCode)) return false;
+  if (exceptionName !== void 0 && new RegExp(`\\b(?:str\\s*\\(\\s*${escapeRegExp(exceptionName)}\\s*\\)|${escapeRegExp(exceptionName)}\\s*[},)])`).test(handler)) return false;
+  if (!/status_code/.test(handlerCode) || !/urlsplit|urlparse|\.path\b|split\s*\(|partition\s*\(/.test(handlerCode)) return false;
+  return true;
+}
+function maskPythonNonCode(source) {
+  const chars = [...source];
+  let index = 0;
+  while (index < chars.length) {
+    const character = chars[index];
+    if (character === "#") {
+      while (index < chars.length && chars[index] !== "\n") {
+        chars[index] = " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (character !== '"' && character !== "'") {
+      index += 1;
+      continue;
+    }
+    const quote = character;
+    const triple = chars[index + 1] === quote && chars[index + 2] === quote;
+    const delimiterLength = triple ? 3 : 1;
+    for (let offset = 0; offset < delimiterLength; offset += 1) chars[index + offset] = " ";
+    index += delimiterLength;
+    while (index < chars.length) {
+      if (triple && chars[index] === quote && chars[index + 1] === quote && chars[index + 2] === quote) {
+        for (let offset = 0; offset < 3; offset += 1) chars[index + offset] = " ";
+        index += 3;
+        break;
+      }
+      if (!triple && chars[index] === quote) {
+        chars[index] = " ";
+        index += 1;
+        break;
+      }
+      if (chars[index] === "\\" && !triple) {
+        chars[index] = " ";
+        if (index + 1 < chars.length && chars[index + 1] !== "\n") chars[index + 1] = " ";
+        index += 2;
+        continue;
+      }
+      if (chars[index] !== "\n") chars[index] = " ";
+      index += 1;
+    }
+  }
+  return chars.join("");
+}
+function lineOffsets(source) {
+  const offsets = [0];
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\n") offsets.push(index + 1);
+  }
+  return offsets;
+}
+function lineIndexAt(offsets, sourceIndex) {
+  let line = 0;
+  while (line + 1 < offsets.length && (offsets[line + 1] ?? 0) <= sourceIndex) line += 1;
+  return line;
+}
+function indentation(source) {
+  return source.match(/^[\t ]*/)?.[0].length ?? 0;
 }
 function balancedSource(source, opening, open2, close) {
   if (opening < 0 || source[opening] !== open2) return void 0;
@@ -17999,24 +18114,25 @@ function balancedSource(source, opening, open2, close) {
 }
 function findFunctionBlocks(source) {
   const blocks = [];
-  const definition = /^(?<indent>[ \\t]*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/gm;
-  for (const match of source.matchAll(definition)) {
+  const executable = maskPythonNonCode(source);
+  const definition = /^(?<indent>[\t ]*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/gm;
+  for (const match of executable.matchAll(definition)) {
     if (match.index === void 0) continue;
     const indent = match.groups?.indent?.length ?? 0;
-    const opening = source.indexOf("(", match.index);
-    const signature = balancedSource(source, opening, "(", ")");
+    const opening = executable.indexOf("(", match.index);
+    const signature = balancedSource(executable, opening, "(", ")");
     if (signature === void 0) continue;
-    const signatureEnd = source.indexOf("\n", signature.end);
-    if (signatureEnd < 0 || !source.slice(signature.end, signatureEnd).includes(":")) continue;
+    const signatureEnd = executable.indexOf("\n", signature.end);
+    if (signatureEnd < 0 || !executable.slice(signature.end, signatureEnd).includes(":")) continue;
     const bodyStart = signatureEnd + 1;
     if (bodyStart <= 0) continue;
     let end = source.length;
     let cursor = bodyStart;
     while (cursor < source.length) {
-      const nextNewline = source.indexOf("\n", cursor);
-      const lineEnd = nextNewline < 0 ? source.length : nextNewline;
-      const line = source.slice(cursor, lineEnd);
-      if (line.trim() !== "" && (line.match(/^[ \\t]*/)?.[0].length ?? 0) <= indent) {
+      const nextNewline = executable.indexOf("\n", cursor);
+      const lineEnd = nextNewline < 0 ? executable.length : nextNewline;
+      const line = executable.slice(cursor, lineEnd);
+      if (line.trim() !== "" && (line.match(/^[\t ]*/)?.[0].length ?? 0) <= indent) {
         end = cursor;
         break;
       }

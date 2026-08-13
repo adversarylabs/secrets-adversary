@@ -222,10 +222,11 @@ test("detects an escaping Requests error with a query credential", async () => {
 });
 
 test("keeps safe Requests credential and query handling quiet", async () => {
-  const output = await review(flowFixture("clean"));
+  const output = await review(flowFixture("clean"), true);
   assert.equal(
     output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
     false,
+    JSON.stringify(output.rawObservations),
   );
 });
 
@@ -271,6 +272,66 @@ test("detects Requests Session errors that are logged and re-raised unchanged", 
     assert.equal(
       output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
       true,
+    );
+  });
+});
+
+test("logging or capturing the original HTTP error remains reportable", async () => {
+  for (const sink of [
+    "logger.exception('request failed')",
+    "print(exc)",
+    "capture_exception(exc)",
+  ]) {
+    await withFixture({
+      "client.py": [
+        "import logging",
+        "import requests",
+        "logger = logging.getLogger(__name__)",
+        "def fetch(session: requests.Session, uri, api_key):",
+        "    response = session.get(uri, params={'api_key': api_key}, timeout=10)",
+        "    try:",
+        "        response.raise_for_status()",
+        "    except requests.HTTPError as exc:",
+        `        ${sink}`,
+        "        return None",
+        "",
+      ].join("\n"),
+    }, async (dir) => {
+      const output = await review(dir);
+      assert.equal(
+        output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+        true,
+        sink,
+      );
+    });
+  }
+});
+
+test("comments docstrings and strings cannot synthesize a Requests flow", async () => {
+  await withFixture({
+    "client.py": [
+      "import requests",
+      "def documentation_only():",
+      "    '''",
+      "    response = requests.get(uri, params={'api_key': api_key})",
+      "    response.raise_for_status()",
+      "    '''",
+      "    text = \"response = requests.get(uri, params={'api_key': api_key}); response.raise_for_status()\"",
+      "    # response = requests.get(uri, params={'api_key': api_key})",
+      "    # response.raise_for_status()",
+      "    return text",
+      "",
+      "fake = '''def fetch():",
+      "    response = requests.get(uri, params={'api_key': api_key})",
+      "    response.raise_for_status()",
+      "'''",
+      "",
+    ].join("\n"),
+  }, async (dir) => {
+    const output = await review(dir);
+    assert.equal(
+      output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+      false,
     );
   });
 });
