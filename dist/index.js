@@ -17887,6 +17887,7 @@ function findQueryCredentialHttpErrors(rule, file) {
         executable,
         match.index,
         opening,
+        executable.slice(opening, call.end),
         block.body.slice(opening, call.end)
       );
       if (credential === void 0) continue;
@@ -17930,16 +17931,19 @@ function hasRequestsReceiverProof(fileSource, block, receiver, requestIndex) {
     "m"
   ).test(block.body.slice(0, requestIndex));
 }
-function credentialQueryMapping(body, executable, requestIndex, callOpening, callSource) {
-  const params = /\bparams\s*=\s*/g.exec(callSource);
+function credentialQueryMapping(body, executable, requestIndex, callOpening, executableCall, originalCall) {
+  const params = /\bparams\s*=\s*/g.exec(executableCall);
   if (params?.index === void 0) return void 0;
   const valueStart = params.index + params[0].length;
-  if (callSource[valueStart] === "{") {
-    const mapping2 = balancedSource(callSource, valueStart, "{", "}");
+  if (executableCall[valueStart] === "{") {
+    const mapping2 = balancedSource(executableCall, valueStart, "{", "}");
     if (mapping2 === void 0) return void 0;
-    return secretMappingEntry(mapping2.source, callOpening + valueStart);
+    return secretMappingEntry(
+      originalCall.slice(valueStart, mapping2.end),
+      callOpening + valueStart
+    );
   }
-  const variable = /^[A-Za-z_]\w*/.exec(callSource.slice(valueStart))?.[0];
+  const variable = /^[A-Za-z_]\w*/.exec(executableCall.slice(valueStart))?.[0];
   if (variable === void 0) return void 0;
   const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
   let selected;

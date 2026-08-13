@@ -132,6 +132,7 @@ function findQueryCredentialHttpErrors(rule: RuleSpec, file: SourceFile): Detect
         executable,
         match.index,
         opening,
+        executable.slice(opening, call.end),
         block.body.slice(opening, call.end),
       );
       if (credential === undefined) continue;
@@ -194,18 +195,22 @@ function credentialQueryMapping(
   executable: string,
   requestIndex: number,
   callOpening: number,
-  callSource: string,
+  executableCall: string,
+  originalCall: string,
 ): { name: string; index: number } | undefined {
-  const params = /\bparams\s*=\s*/g.exec(callSource);
+  const params = /\bparams\s*=\s*/g.exec(executableCall);
   if (params?.index === undefined) return undefined;
   const valueStart = params.index + params[0].length;
-  if (callSource[valueStart] === "{") {
-    const mapping = balancedSource(callSource, valueStart, "{", "}");
+  if (executableCall[valueStart] === "{") {
+    const mapping = balancedSource(executableCall, valueStart, "{", "}");
     if (mapping === undefined) return undefined;
-    return secretMappingEntry(mapping.source, callOpening + valueStart);
+    return secretMappingEntry(
+      originalCall.slice(valueStart, mapping.end),
+      callOpening + valueStart,
+    );
   }
 
-  const variable = /^[A-Za-z_]\w*/.exec(callSource.slice(valueStart))?.[0];
+  const variable = /^[A-Za-z_]\w*/.exec(executableCall.slice(valueStart))?.[0];
   if (variable === undefined) return undefined;
   const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
   let selected: RegExpExecArray | undefined;

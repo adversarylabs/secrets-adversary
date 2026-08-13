@@ -336,6 +336,38 @@ test("comments docstrings and strings cannot synthesize a Requests flow", async 
   });
 });
 
+test("non-code params text inside a real Requests call stays quiet", async () => {
+  await withFixture({
+    "client.py": [
+      "import requests",
+      "def send_string_payload(uri, api_key):",
+      "    response = requests.post(",
+      "        uri,",
+      "        data=\"params={'api_key': api_key}\",",
+      "        timeout=10,",
+      "    )",
+      "    response.raise_for_status()",
+      "    return response.json()",
+      "",
+      "def fetch_with_commented_example(uri, api_key):",
+      "    response = requests.get(",
+      "        uri,",
+      "        # params={'api_key': api_key},",
+      "        timeout=10,",
+      "    )",
+      "    response.raise_for_status()",
+      "    return response.json()",
+      "",
+    ].join("\n"),
+  }, async (dir) => {
+    const output = await review(dir);
+    assert.equal(
+      output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+      false,
+    );
+  });
+});
+
 test("query credential error findings stay local to semantic changes", async () => {
   const safe = [
     "import requests",
