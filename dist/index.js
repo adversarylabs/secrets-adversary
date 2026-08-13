@@ -17093,11 +17093,35 @@ function isRedactionReturnLine(line, match) {
 var spec = {
   "id": "secrets",
   "displayName": "Secrets",
-  "description": "Scans repository text for high-confidence committed credentials and private keys.",
+  "description": "Scans repository text for committed credentials and narrow credential exposure paths.",
   "files": [
     "**/*"
   ],
   "rules": [
+    {
+      "id": "secrets.query-credential-http-error",
+      "title": "HTTP error can expose a query-string credential",
+      "summary": "HTTP error can expose a query-string credential",
+      "category": "secrets",
+      "severity": "medium",
+      "confidence": "medium",
+      "whyItMatters": "Requests includes the prepared URL in errors raised by raise_for_status, so a credential carried in params can become part of exception text.",
+      "impact": "Exception reporting or logging can disclose the credential to operators, logs, and downstream error systems.",
+      "recommendation": "Catch the HTTP error and raise a sanitized replacement that retains status and path while dropping the query string and original exception chain.",
+      "complexity": "small",
+      "tags": [
+        "secrets",
+        "python",
+        "requests",
+        "exception"
+      ],
+      "match": {
+        "kind": "query-credential-http-error",
+        "files": [
+          "**/*.py"
+        ]
+      }
+    },
     {
       "id": "secrets.aws.access-key-id",
       "title": "AWS access key ID in source",
@@ -17568,7 +17592,7 @@ function registerRules(app) {
           recommendation: rule.recommendation,
           remediation: { complexity: rule.complexity },
           tags: rule.tags,
-          confidence: Confidence.High
+          confidence: rule.confidence
         };
       }
     });
@@ -17824,6 +17848,9 @@ function evaluate(rule, sources, allPaths) {
     if (triggers.length === 0 || required) return [];
     return [{ rule, file: triggers[0] ?? ".", line: 1, snippet: triggers[0] ?? "", label: rule.title, data: { triggerFiles: triggers.slice(0, 10), requiredFiles: match.requiredFiles } }];
   }
+  if (match.kind === "query-credential-http-error") {
+    return sources.filter((file) => match.files.some((glob) => matchesGlob(file.path, glob))).flatMap((file) => findQueryCredentialHttpErrors(rule, file));
+  }
   const matchingSources = sources.filter((file) => match.files.some((glob) => matchesGlob(file.path, glob)));
   if (match.kind === "missing-content") {
     return matchingSources.flatMap((file) => {
@@ -17843,6 +17870,168 @@ function evaluate(rule, sources, allPaths) {
       data: { matchedPattern: match.pattern.pattern }
     }));
   });
+}
+function findQueryCredentialHttpErrors(rule, file) {
+  const detections = [];
+  for (const block of findFunctionBlocks(file.source)) {
+    const request = /\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.(get|post|put|patch|delete|head|request)\s*\(/g;
+    for (const match of block.body.matchAll(request)) {
+      if (match.index === void 0 || match[1] === void 0 || match[2] === void 0) continue;
+      if (!hasRequestsReceiverProof(file.source, block, match[2], match.index)) continue;
+      const opening = block.body.indexOf("(", match.index + match[0].length - 1);
+      const call = balancedSource(block.body, opening, "(", ")");
+      if (call === void 0) continue;
+      const credential = credentialQueryMapping(block.body, match.index, opening, call.source);
+      if (credential === void 0) continue;
+      const response = match[1];
+      const afterCall = block.body.slice(call.end);
+      const raise = new RegExp(`\\b${escapeRegExp(response)}\\.raise_for_status\\s*\\(\\s*\\)`).exec(afterCall);
+      if (raise?.index === void 0) continue;
+      const between = afterCall.slice(0, raise.index);
+      if (new RegExp(`^\\s*${escapeRegExp(response)}\\s*=`, "m").test(between)) continue;
+      const raiseIndex = call.end + raise.index;
+      if (hasSanitizedHttpErrorHandler(block.body, raiseIndex)) continue;
+      const semanticIndexes = [credential.index, match.index, raiseIndex].map((index) => block.start + index);
+      const semanticLines = semanticIndexes.map((index) => file.source.slice(0, index).split(/\r?\n/).length);
+      const line = file.status === "modified" ? semanticLines.find((candidate) => file.changedLines.has(candidate)) : semanticLines[0];
+      if (line === void 0) continue;
+      detections.push({
+        rule,
+        file: file.path,
+        line,
+        snippet: file.source.split(/\r?\n/)[line - 1]?.trim().slice(0, 240) ?? "",
+        label: `${credential.name} enters a URL-bearing HTTP error`,
+        data: {
+          credential: credential.name,
+          parameterLine: semanticLines[0],
+          requestLine: semanticLines[1],
+          raiseLine: semanticLines[2]
+        }
+      });
+    }
+  }
+  return detections;
+}
+function hasRequestsReceiverProof(fileSource, block, receiver, requestIndex) {
+  if (!/(?:^|\n)\s*import\s+requests\b/.test(fileSource)) return false;
+  if (receiver === "requests") return true;
+  if (new RegExp(`\\b${escapeRegExp(receiver)}\\s*:\\s*requests\\.Session\\b`).test(block.signature)) {
+    return true;
+  }
+  return new RegExp(
+    `^\\s*${escapeRegExp(receiver)}\\s*(?::[^=\\n]+)?=\\s*requests\\.Session\\s*\\(`,
+    "m"
+  ).test(block.body.slice(0, requestIndex));
+}
+function credentialQueryMapping(body, requestIndex, callOpening, callSource) {
+  const params = /\bparams\s*=\s*/g.exec(callSource);
+  if (params?.index === void 0) return void 0;
+  const valueStart = params.index + params[0].length;
+  if (callSource[valueStart] === "{") {
+    const mapping2 = balancedSource(callSource, valueStart, "{", "}");
+    if (mapping2 === void 0) return void 0;
+    return secretMappingEntry(mapping2.source, callOpening + valueStart);
+  }
+  const variable = /^[A-Za-z_]\w*/.exec(callSource.slice(valueStart))?.[0];
+  if (variable === void 0) return void 0;
+  const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
+  let selected;
+  for (const candidate of body.slice(0, requestIndex).matchAll(assignment)) selected = candidate;
+  if (selected?.index === void 0) return void 0;
+  const opening = body.indexOf("{", selected.index);
+  const mapping = balancedSource(body, opening, "{", "}");
+  if (mapping === void 0 || mapping.end > requestIndex) return void 0;
+  return secretMappingEntry(mapping.source, opening);
+}
+function secretMappingEntry(source, sourceIndex) {
+  const entry = /["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:\s*([^,}\n]+)/g;
+  for (const match of source.matchAll(entry)) {
+    if (match.index === void 0 || match[1] === void 0 || match[2] === void 0) continue;
+    const key = match[1];
+    const value = match[2].trim();
+    if (isSecretName(key) || isSecretName(value)) {
+      return { name: isSecretName(value) ? value : key, index: sourceIndex + match.index };
+    }
+  }
+  return void 0;
+}
+function isSecretName(value) {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (/(?:^|_)(?:page|next|continuation|cursor)_token(?:_|$)/.test(normalized)) return false;
+  return /(?:^|_)(?:api_key|access_key|private_key|access_token|auth_token|secret|password|passwd|credential|bearer|auth|token)(?:_|$)/.test(normalized);
+}
+function hasSanitizedHttpErrorHandler(body, raiseIndex) {
+  const before = body.slice(Math.max(0, raiseIndex - 1200), raiseIndex);
+  if (!/^\s*try\s*:\s*$/m.test(before)) return false;
+  const after = body.slice(raiseIndex, raiseIndex + 2e3);
+  const handler = /^\s*except\s+(?:requests\.)?(?:exceptions\.)?(?:HTTPError|RequestException)\b[^:]*:\s*\n((?:[ \\t]+[^\n]*(?:\n|$)){1,12})/m.exec(after)?.[1];
+  if (handler === void 0) return false;
+  if (!/^\s*raise\b/m.test(handler)) return true;
+  if (!/\bfrom\s+None\b/.test(handler)) return false;
+  if (/\bstr\s*\(|\braise\s*$/m.test(handler)) return false;
+  if (/\.(?:request|response)\.url\b/.test(handler) && !/urlsplit|urlparse|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler)) return false;
+  return /status_code|urlsplit|urlparse|\.path\b|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler);
+}
+function balancedSource(source, opening, open2, close) {
+  if (opening < 0 || source[opening] !== open2) return void 0;
+  let depth = 0;
+  let quote;
+  let escaped = false;
+  for (let index = opening; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote !== void 0) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = void 0;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === open2) depth += 1;
+    else if (character === close) {
+      depth -= 1;
+      if (depth === 0) return { source: source.slice(opening, index + 1), end: index + 1 };
+    }
+  }
+  return void 0;
+}
+function findFunctionBlocks(source) {
+  const blocks = [];
+  const definition = /^(?<indent>[ \\t]*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/gm;
+  for (const match of source.matchAll(definition)) {
+    if (match.index === void 0) continue;
+    const indent = match.groups?.indent?.length ?? 0;
+    const opening = source.indexOf("(", match.index);
+    const signature = balancedSource(source, opening, "(", ")");
+    if (signature === void 0) continue;
+    const signatureEnd = source.indexOf("\n", signature.end);
+    if (signatureEnd < 0 || !source.slice(signature.end, signatureEnd).includes(":")) continue;
+    const bodyStart = signatureEnd + 1;
+    if (bodyStart <= 0) continue;
+    let end = source.length;
+    let cursor = bodyStart;
+    while (cursor < source.length) {
+      const nextNewline = source.indexOf("\n", cursor);
+      const lineEnd = nextNewline < 0 ? source.length : nextNewline;
+      const line = source.slice(cursor, lineEnd);
+      if (line.trim() !== "" && (line.match(/^[ \\t]*/)?.[0].length ?? 0) <= indent) {
+        end = cursor;
+        break;
+      }
+      cursor = nextNewline < 0 ? source.length : nextNewline + 1;
+    }
+    blocks.push({
+      body: source.slice(bodyStart, end),
+      start: bodyStart,
+      signature: source.slice(match.index, signatureEnd)
+    });
+  }
+  return blocks;
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 function directFindingEligible(file, line) {
   return file.status !== "modified" || file.changedLines.has(line);

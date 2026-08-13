@@ -83,6 +83,12 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
     return [{ rule, file: triggers[0] ?? ".", line: 1, snippet: triggers[0] ?? "", label: rule.title, data: { triggerFiles: triggers.slice(0, 10), requiredFiles: match.requiredFiles } }];
   }
 
+  if (match.kind === "query-credential-http-error") {
+    return sources
+      .filter((file) => match.files.some((glob) => matchesGlob(file.path, glob)))
+      .flatMap((file) => findQueryCredentialHttpErrors(rule, file));
+  }
+
   const matchingSources = sources.filter((file) => match.files.some((glob) => matchesGlob(file.path, glob)));
   if (match.kind === "missing-content") {
     return matchingSources.flatMap((file) => {
@@ -105,6 +111,203 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
         data: { matchedPattern: match.pattern.pattern },
       }));
   });
+}
+
+interface FunctionBlock { body: string; start: number; signature: string }
+interface BalancedSource { source: string; end: number }
+
+function findQueryCredentialHttpErrors(rule: RuleSpec, file: SourceFile): Detection[] {
+  const detections: Detection[] = [];
+  for (const block of findFunctionBlocks(file.source)) {
+    const request = /\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.(get|post|put|patch|delete|head|request)\s*\(/g;
+    for (const match of block.body.matchAll(request)) {
+      if (match.index === undefined || match[1] === undefined || match[2] === undefined) continue;
+      if (!hasRequestsReceiverProof(file.source, block, match[2], match.index)) continue;
+      const opening = block.body.indexOf("(", match.index + match[0].length - 1);
+      const call = balancedSource(block.body, opening, "(", ")");
+      if (call === undefined) continue;
+      const credential = credentialQueryMapping(block.body, match.index, opening, call.source);
+      if (credential === undefined) continue;
+
+      const response = match[1];
+      const afterCall = block.body.slice(call.end);
+      const raise = new RegExp(`\\b${escapeRegExp(response)}\\.raise_for_status\\s*\\(\\s*\\)`).exec(afterCall);
+      if (raise?.index === undefined) continue;
+      const between = afterCall.slice(0, raise.index);
+      if (new RegExp(`^\\s*${escapeRegExp(response)}\\s*=`, "m").test(between)) continue;
+      const raiseIndex = call.end + raise.index;
+      if (hasSanitizedHttpErrorHandler(block.body, raiseIndex)) continue;
+
+      const semanticIndexes = [credential.index, match.index, raiseIndex]
+        .map((index) => block.start + index);
+      const semanticLines = semanticIndexes
+        .map((index) => file.source.slice(0, index).split(/\r?\n/).length);
+      const line = file.status === "modified"
+        ? semanticLines.find((candidate) => file.changedLines.has(candidate))
+        : semanticLines[0];
+      if (line === undefined) continue;
+
+      detections.push({
+        rule,
+        file: file.path,
+        line,
+        snippet: file.source.split(/\r?\n/)[line - 1]?.trim().slice(0, 240) ?? "",
+        label: `${credential.name} enters a URL-bearing HTTP error`,
+        data: {
+          credential: credential.name,
+          parameterLine: semanticLines[0],
+          requestLine: semanticLines[1],
+          raiseLine: semanticLines[2],
+        },
+      });
+    }
+  }
+  return detections;
+}
+
+function hasRequestsReceiverProof(
+  fileSource: string,
+  block: FunctionBlock,
+  receiver: string,
+  requestIndex: number,
+): boolean {
+  if (!/(?:^|\n)\s*import\s+requests\b/.test(fileSource)) return false;
+  if (receiver === "requests") return true;
+  if (new RegExp(`\\b${escapeRegExp(receiver)}\\s*:\\s*requests\\.Session\\b`).test(block.signature)) {
+    return true;
+  }
+  return new RegExp(
+    `^\\s*${escapeRegExp(receiver)}\\s*(?::[^=\\n]+)?=\\s*requests\\.Session\\s*\\(`,
+    "m",
+  ).test(block.body.slice(0, requestIndex));
+}
+
+function credentialQueryMapping(
+  body: string,
+  requestIndex: number,
+  callOpening: number,
+  callSource: string,
+): { name: string; index: number } | undefined {
+  const params = /\bparams\s*=\s*/g.exec(callSource);
+  if (params?.index === undefined) return undefined;
+  const valueStart = params.index + params[0].length;
+  if (callSource[valueStart] === "{") {
+    const mapping = balancedSource(callSource, valueStart, "{", "}");
+    if (mapping === undefined) return undefined;
+    return secretMappingEntry(mapping.source, callOpening + valueStart);
+  }
+
+  const variable = /^[A-Za-z_]\w*/.exec(callSource.slice(valueStart))?.[0];
+  if (variable === undefined) return undefined;
+  const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
+  let selected: RegExpExecArray | undefined;
+  for (const candidate of body.slice(0, requestIndex).matchAll(assignment)) selected = candidate;
+  if (selected?.index === undefined) return undefined;
+  const opening = body.indexOf("{", selected.index);
+  const mapping = balancedSource(body, opening, "{", "}");
+  if (mapping === undefined || mapping.end > requestIndex) return undefined;
+  return secretMappingEntry(mapping.source, opening);
+}
+
+function secretMappingEntry(source: string, sourceIndex: number): { name: string; index: number } | undefined {
+  const entry = /["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:\s*([^,}\n]+)/g;
+  for (const match of source.matchAll(entry)) {
+    if (match.index === undefined || match[1] === undefined || match[2] === undefined) continue;
+    const key = match[1];
+    const value = match[2].trim();
+    if (isSecretName(key) || isSecretName(value)) {
+      return { name: isSecretName(value) ? value : key, index: sourceIndex + match.index };
+    }
+  }
+  return undefined;
+}
+
+function isSecretName(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (/(?:^|_)(?:page|next|continuation|cursor)_token(?:_|$)/.test(normalized)) return false;
+  return /(?:^|_)(?:api_key|access_key|private_key|access_token|auth_token|secret|password|passwd|credential|bearer|auth|token)(?:_|$)/.test(normalized);
+}
+
+function hasSanitizedHttpErrorHandler(body: string, raiseIndex: number): boolean {
+  const before = body.slice(Math.max(0, raiseIndex - 1_200), raiseIndex);
+  if (!/^\s*try\s*:\s*$/m.test(before)) return false;
+  const after = body.slice(raiseIndex, raiseIndex + 2_000);
+  const handler = /^\s*except\s+(?:requests\.)?(?:exceptions\.)?(?:HTTPError|RequestException)\b[^:]*:\s*\n((?:[ \\t]+[^\n]*(?:\n|$)){1,12})/m.exec(after)?.[1];
+  if (handler === undefined) return false;
+  if (!/^\s*raise\b/m.test(handler)) return true;
+  if (!/\bfrom\s+None\b/.test(handler)) return false;
+  if (/\bstr\s*\(|\braise\s*$/m.test(handler)) return false;
+  if (/\.(?:request|response)\.url\b/.test(handler) && !/urlsplit|urlparse|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler)) return false;
+  return /status_code|urlsplit|urlparse|\.path\b|split\s*\(\s*["']\?["']|partition\s*\(\s*["']\?["']/.test(handler);
+}
+
+function balancedSource(
+  source: string,
+  opening: number,
+  open: "(" | "{",
+  close: ")" | "}",
+): BalancedSource | undefined {
+  if (opening < 0 || source[opening] !== open) return undefined;
+  let depth = 0;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let index = opening; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === open) depth += 1;
+    else if (character === close) {
+      depth -= 1;
+      if (depth === 0) return { source: source.slice(opening, index + 1), end: index + 1 };
+    }
+  }
+  return undefined;
+}
+
+function findFunctionBlocks(source: string): FunctionBlock[] {
+  const blocks: FunctionBlock[] = [];
+  const definition = /^(?<indent>[ \\t]*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/gm;
+  for (const match of source.matchAll(definition)) {
+    if (match.index === undefined) continue;
+    const indent = match.groups?.indent?.length ?? 0;
+    const opening = source.indexOf("(", match.index);
+    const signature = balancedSource(source, opening, "(", ")");
+    if (signature === undefined) continue;
+    const signatureEnd = source.indexOf("\n", signature.end);
+    if (signatureEnd < 0 || !source.slice(signature.end, signatureEnd).includes(":")) continue;
+    const bodyStart = signatureEnd + 1;
+    if (bodyStart <= 0) continue;
+    let end = source.length;
+    let cursor = bodyStart;
+    while (cursor < source.length) {
+      const nextNewline = source.indexOf("\n", cursor);
+      const lineEnd = nextNewline < 0 ? source.length : nextNewline;
+      const line = source.slice(cursor, lineEnd);
+      if (line.trim() !== "" && (line.match(/^[ \\t]*/)?.[0].length ?? 0) <= indent) {
+        end = cursor;
+        break;
+      }
+      cursor = nextNewline < 0 ? source.length : nextNewline + 1;
+    }
+    blocks.push({
+      body: source.slice(bodyStart, end),
+      start: bodyStart,
+      signature: source.slice(match.index, signatureEnd),
+    });
+  }
+  return blocks;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function directFindingEligible(file: SourceFile, line: number): boolean {

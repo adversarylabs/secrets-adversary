@@ -8,18 +8,20 @@ Source of truth for what this adversary is *for*.
 
 ## Mission
 
-Find high-confidence committed credentials and private keys in repository text.
+Find high-confidence committed credentials and private keys in repository text, plus narrow changed-code paths that expose credential values through logs or exceptions.
 
 ## In scope (fair miss if humans raised it and we did not)
 
 - API keys, tokens, private keys committed in tree
 - High-confidence secret material in files
 - Known framework default secrets that remain usable credential material
+- Changed code that demonstrably places a credential in an exception or logging surface
 
 ## Out of scope (not a miss for this adversary)
 
 - Design-level auth architecture (go-security)
 - Workflow secret *wiring* without committed values (github-actions)
+- General data-flow speculation without a concrete credential source and disclosure sink
 
 ## Factory grading rule
 

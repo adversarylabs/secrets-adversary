@@ -1,6 +1,6 @@
 name: security/secrets
 version: 0.0.14
-description: Scans repository text for high-confidence committed credentials and private keys.
+description: Scans repository text for committed credentials and narrow credential exposure paths.
 
 triggers:
   manual: true

@@ -4,21 +4,46 @@ export interface MatchExpression { pattern: string; flags: string }
 interface ContentMatch { kind: "content"; files: string[]; pattern: MatchExpression; requires: MatchExpression[] }
 interface MissingContentMatch { kind: "missing-content"; files: string[]; trigger: MatchExpression; required: MatchExpression }
 interface MissingFileMatch { kind: "missing-file"; triggerFiles: string[]; requiredFiles: string[] }
+interface QueryCredentialHttpErrorMatch { kind: "query-credential-http-error"; files: string[] }
 export interface RuleSpec {
   id: string; title: string; summary: string; category: string; severity: Severity; confidence: Confidence;
   whyItMatters: string; impact: string; recommendation: string; complexity: "trivial" | "small" | "medium" | "large"; tags: string[];
-  match: ContentMatch | MissingContentMatch | MissingFileMatch;
+  match: ContentMatch | MissingContentMatch | MissingFileMatch | QueryCredentialHttpErrorMatch;
 }
 export interface AdversarySpec { id: string; displayName: string; description: string; files: string[]; rules: RuleSpec[] }
 
 export const spec = {
   "id": "secrets",
   "displayName": "Secrets",
-  "description": "Scans repository text for high-confidence committed credentials and private keys.",
+  "description": "Scans repository text for committed credentials and narrow credential exposure paths.",
   "files": [
     "**/*"
   ],
   "rules": [
+    {
+      "id": "secrets.query-credential-http-error",
+      "title": "HTTP error can expose a query-string credential",
+      "summary": "HTTP error can expose a query-string credential",
+      "category": "secrets",
+      "severity": "medium",
+      "confidence": "medium",
+      "whyItMatters": "Requests includes the prepared URL in errors raised by raise_for_status, so a credential carried in params can become part of exception text.",
+      "impact": "Exception reporting or logging can disclose the credential to operators, logs, and downstream error systems.",
+      "recommendation": "Catch the HTTP error and raise a sanitized replacement that retains status and path while dropping the query string and original exception chain.",
+      "complexity": "small",
+      "tags": [
+        "secrets",
+        "python",
+        "requests",
+        "exception"
+      ],
+      "match": {
+        "kind": "query-credential-http-error",
+        "files": [
+          "**/*.py"
+        ]
+      }
+    },
     {
       "id": "secrets.aws.access-key-id",
       "title": "AWS access key ID in source",

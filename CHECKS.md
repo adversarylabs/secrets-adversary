@@ -163,3 +163,15 @@ Regression entry: [`test/`](test/) including false-positive cases.
 | **Looks for** | Secret manifests containing data/stringData |
 | **Stays quiet when** | External secrets / sealed secrets |
 | **Remediation** | Do not commit raw Secret data |
+
+## Medium
+
+### `secrets.query-credential-http-error`
+
+| | |
+| --- | --- |
+| **What** | Python Requests code puts a credential-bearing value in `params=` and lets `raise_for_status()` expose the prepared URL through an escaping HTTP error |
+| **Why** | Requests includes the prepared URL, including its query string, in the HTTP error text; exception reporting can therefore disclose the credential |
+| **Looks for** | A secret-like key or value in a Requests query mapping, the bound request call, and `raise_for_status()` on that response in the same function |
+| **Stays quiet when** | Query values are ordinary filters or pagination state; credentials use headers or `auth=`; no URL-bearing error is raised; or a local handler emits a sanitized status/path-only error without exception chaining |
+| **Remediation** | Preserve the status and request path in a sanitized error while omitting the query string and original URL-bearing exception text |

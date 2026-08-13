@@ -28,6 +28,8 @@ async function withFixture(
 
 const review = (path: string, raw = false) =>
   createApp().run({ input: { source: { path } }, includeRawObservations: raw });
+const flowFixture = (kind: "vulnerable" | "clean") =>
+  new URL(`../fixtures/rules/query-credential-http-error/${kind}`, import.meta.url).pathname;
 
 /** Build synthetic detector samples without embedding provider-valid secret strings in source. */
 function parts(...chunks: string[]): string {
@@ -201,6 +203,109 @@ test("accepts a repository without secrets", async () => {
   const fixture = new URL("../fixtures/clean", import.meta.url).pathname;
   const output = await review(fixture);
   assert.deepEqual(output.findings, []);
+});
+
+test("detects an escaping Requests error with a query credential", async () => {
+  const output = await review(flowFixture("vulnerable"), true);
+  const observation = output.rawObservations?.find(
+    (item) => item.ruleId === "secrets.query-credential-http-error",
+  );
+  assert.equal(observation?.location?.file, "client.py");
+  assert.equal(observation?.location?.line, 10);
+  assert.deepEqual(observation?.evidence, {
+    label: "api_key enters a URL-bearing HTTP error",
+    credential: "api_key",
+    parameterLine: 10,
+    requestLine: 13,
+    raiseLine: 14,
+  });
+});
+
+test("keeps safe Requests credential and query handling quiet", async () => {
+  const output = await review(flowFixture("clean"));
+  assert.equal(
+    output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+    false,
+  );
+});
+
+test("detects inline credential params without requiring a project-specific key", async () => {
+  await withFixture({
+    "client.py": [
+      "import requests",
+      "def fetch(uri, token):",
+      "    response = requests.get(uri, params={'access_token': token}, timeout=10)",
+      "    response.raise_for_status()",
+      "    return response.json()",
+      "",
+    ].join("\n"),
+  }, async (dir) => {
+    const output = await review(dir);
+    assert.equal(
+      output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+      true,
+    );
+  });
+});
+
+test("detects Requests Session errors that are logged and re-raised unchanged", async () => {
+  await withFixture({
+    "client.py": [
+      "import logging",
+      "import requests",
+      "logger = logging.getLogger(__name__)",
+      "def fetch(uri, api_key):",
+      "    session = requests.Session()",
+      "    params = {'auth': api_key}",
+      "    response = session.get(uri, params=params, timeout=10)",
+      "    try:",
+      "        response.raise_for_status()",
+      "    except requests.HTTPError:",
+      "        logger.exception('request failed')",
+      "        raise",
+      "    return response.json()",
+      "",
+    ].join("\n"),
+  }, async (dir) => {
+    const output = await review(dir);
+    assert.equal(
+      output.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+      true,
+    );
+  });
+});
+
+test("query credential error findings stay local to semantic changes", async () => {
+  const safe = [
+    "import requests",
+    "def fetch(session: requests.Session, uri, page, api_key):",
+    "    params = {'page': page}",
+    "    response = session.get(uri, params=params, timeout=10)",
+    "    response.raise_for_status()",
+    "    return response.json()",
+    "",
+  ].join("\n");
+  const root = await gitRepository({ "client.py": safe });
+  try {
+    await writeFile(join(root, "client.py"), `${safe}\n# document client ownership\n`);
+    const unrelated = await changedReview(root, ["client.py"]);
+    assert.equal(
+      unrelated.findings.some((item) => item.ruleId === "secrets.query-credential-http-error"),
+      false,
+    );
+
+    await writeFile(
+      join(root, "client.py"),
+      safe.replace("{'page': page}", "{'api_key': api_key}"),
+    );
+    const changed = await changedReview(root, ["client.py"]);
+    const observation = changed.rawObservations?.find(
+      (item) => item.ruleId === "secrets.query-credential-http-error",
+    );
+    assert.equal(observation?.location?.line, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("an unrelated edit does not surface a legacy direct secret", async () => {
