@@ -83,6 +83,12 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
     return [{ rule, file: triggers[0] ?? ".", line: 1, snippet: triggers[0] ?? "", label: rule.title, data: { triggerFiles: triggers.slice(0, 10), requiredFiles: match.requiredFiles } }];
   }
 
+  if (match.kind === "query-credential-http-error") {
+    return sources
+      .filter((file) => match.files.some((glob) => matchesGlob(file.path, glob)))
+      .flatMap((file) => findQueryCredentialHttpErrors(rule, file));
+  }
+
   const matchingSources = sources.filter((file) => match.files.some((glob) => matchesGlob(file.path, glob)));
   if (match.kind === "missing-content") {
     return matchingSources.flatMap((file) => {
@@ -105,6 +111,331 @@ function evaluate(rule: RuleSpec, sources: SourceFile[], allPaths: string[]): De
         data: { matchedPattern: match.pattern.pattern },
       }));
   });
+}
+
+interface FunctionBlock { body: string; start: number; signature: string }
+interface BalancedSource { source: string; end: number }
+
+function findQueryCredentialHttpErrors(rule: RuleSpec, file: SourceFile): Detection[] {
+  const detections: Detection[] = [];
+  for (const block of findFunctionBlocks(file.source)) {
+    const executable = maskPythonNonCode(block.body);
+    const request = /\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.(get|post|put|patch|delete|head|request)\s*\(/g;
+    for (const match of executable.matchAll(request)) {
+      if (match.index === undefined || match[1] === undefined || match[2] === undefined) continue;
+      if (!hasRequestsReceiverProof(maskPythonNonCode(file.source), block, match[2], match.index)) continue;
+      const opening = executable.indexOf("(", match.index + match[0].length - 1);
+      const call = balancedSource(executable, opening, "(", ")");
+      if (call === undefined) continue;
+      const credential = credentialQueryMapping(
+        block.body,
+        executable,
+        match.index,
+        opening,
+        executable.slice(opening, call.end),
+        block.body.slice(opening, call.end),
+      );
+      if (credential === undefined) continue;
+
+      const response = match[1];
+      const afterCall = executable.slice(call.end);
+      const raise = new RegExp(`\\b${escapeRegExp(response)}\\.raise_for_status\\s*\\(\\s*\\)`).exec(afterCall);
+      if (raise?.index === undefined) continue;
+      const between = afterCall.slice(0, raise.index);
+      if (new RegExp(`^\\s*${escapeRegExp(response)}\\s*=`, "m").test(between)) continue;
+      const raiseIndex = call.end + raise.index;
+      if (isContainedBySafeHttpErrorHandler(block.body, executable, raiseIndex)) continue;
+
+      const semanticIndexes = [credential.index, match.index, raiseIndex]
+        .map((index) => block.start + index);
+      const semanticLines = semanticIndexes
+        .map((index) => file.source.slice(0, index).split(/\r?\n/).length);
+      const line = file.status === "modified"
+        ? semanticLines.find((candidate) => file.changedLines.has(candidate))
+        : semanticLines[0];
+      if (line === undefined) continue;
+
+      detections.push({
+        rule,
+        file: file.path,
+        line,
+        snippet: file.source.split(/\r?\n/)[line - 1]?.trim().slice(0, 240) ?? "",
+        label: `${credential.name} enters a URL-bearing HTTP error`,
+        data: {
+          credential: credential.name,
+          parameterLine: semanticLines[0],
+          requestLine: semanticLines[1],
+          raiseLine: semanticLines[2],
+        },
+      });
+    }
+  }
+  return detections;
+}
+
+function hasRequestsReceiverProof(
+  fileSource: string,
+  block: FunctionBlock,
+  receiver: string,
+  requestIndex: number,
+): boolean {
+  if (!/(?:^|\n)\s*import\s+requests\b/.test(fileSource)) return false;
+  if (receiver === "requests") return true;
+  if (new RegExp(`\\b${escapeRegExp(receiver)}\\s*:\\s*requests\\.Session\\b`).test(block.signature)) {
+    return true;
+  }
+  return new RegExp(
+    `^\\s*${escapeRegExp(receiver)}\\s*(?::[^=\\n]+)?=\\s*requests\\.Session\\s*\\(`,
+    "m",
+  ).test(block.body.slice(0, requestIndex));
+}
+
+function credentialQueryMapping(
+  body: string,
+  executable: string,
+  requestIndex: number,
+  callOpening: number,
+  executableCall: string,
+  originalCall: string,
+): { name: string; index: number } | undefined {
+  const params = /\bparams\s*=\s*/g.exec(executableCall);
+  if (params?.index === undefined) return undefined;
+  const valueStart = params.index + params[0].length;
+  if (executableCall[valueStart] === "{") {
+    const mapping = balancedSource(executableCall, valueStart, "{", "}");
+    if (mapping === undefined) return undefined;
+    return secretMappingEntry(
+      originalCall.slice(valueStart, mapping.end),
+      callOpening + valueStart,
+    );
+  }
+
+  const variable = /^[A-Za-z_]\w*/.exec(executableCall.slice(valueStart))?.[0];
+  if (variable === undefined) return undefined;
+  const assignment = new RegExp(`^([ \\t]*)${escapeRegExp(variable)}\\s*=\\s*\\{`, "gm");
+  let selected: RegExpExecArray | undefined;
+  for (const candidate of executable.slice(0, requestIndex).matchAll(assignment)) selected = candidate;
+  if (selected?.index === undefined) return undefined;
+  const opening = executable.indexOf("{", selected.index);
+  const mapping = balancedSource(executable, opening, "{", "}");
+  if (mapping === undefined || mapping.end > requestIndex) return undefined;
+  return secretMappingEntry(body.slice(opening, mapping.end), opening);
+}
+
+function secretMappingEntry(source: string, sourceIndex: number): { name: string; index: number } | undefined {
+  const entry = /["']([A-Za-z_][A-Za-z0-9_-]*)["']\s*:\s*([^,}\n]+)/g;
+  for (const match of source.matchAll(entry)) {
+    if (match.index === undefined || match[1] === undefined || match[2] === undefined) continue;
+    const key = match[1];
+    const value = match[2].trim();
+    if (isSecretName(key) || isSecretName(value)) {
+      return { name: isSecretName(value) ? value : key, index: sourceIndex + match.index };
+    }
+  }
+  return undefined;
+}
+
+function isSecretName(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  if (/(?:^|_)(?:page|next|continuation|cursor)_token(?:_|$)/.test(normalized)) return false;
+  return /(?:^|_)(?:api_key|access_key|private_key|access_token|auth_token|secret|password|passwd|credential|bearer|auth|token)(?:_|$)/.test(normalized);
+}
+
+function isContainedBySafeHttpErrorHandler(body: string, executable: string, raiseIndex: number): boolean {
+  const lines = executable.split(/\r?\n/);
+  const originalLines = body.split(/\r?\n/);
+  const offsets = lineOffsets(executable);
+  const raiseLine = lineIndexAt(offsets, raiseIndex);
+  const raiseIndent = indentation(lines[raiseLine] ?? "");
+  let tryLine = -1;
+  for (let index = raiseLine - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() === "") continue;
+    const indent = indentation(line);
+    if (indent >= raiseIndent || !/^\s*try\s*:\s*$/.test(line)) continue;
+    const containsRaise = lines
+      .slice(index + 1, raiseLine + 1)
+      .every((nested) => nested.trim() === "" || indentation(nested) > indent);
+    if (containsRaise) {
+      tryLine = index;
+      break;
+    }
+  }
+  if (tryLine < 0) return false;
+  const tryIndent = indentation(lines[tryLine] ?? "");
+  let exceptLine = -1;
+  for (let index = raiseLine + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() === "") continue;
+    const indent = indentation(line);
+    if (indent < tryIndent) break;
+    if (indent === tryIndent) {
+      if (/^\s*except\s+(?:requests\.)?(?:exceptions\.)?(?:HTTPError|RequestException)\b/.test(originalLines[index] ?? "")) {
+        exceptLine = index;
+      }
+      break;
+    }
+  }
+  if (exceptLine < 0) return false;
+  let endLine = lines.length;
+  for (let index = exceptLine + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.trim() !== "" && indentation(line) <= tryIndent) {
+      endLine = index;
+      break;
+    }
+  }
+  const handlerStart = offsets[exceptLine] ?? 0;
+  const handlerEnd = offsets[endLine] ?? executable.length;
+  const handler = body.slice(handlerStart, handlerEnd);
+  const handlerCode = executable.slice(handlerStart, handlerEnd);
+  const header = originalLines[exceptLine] ?? "";
+  const exceptionName = /\bas\s+([A-Za-z_]\w*)\s*:/.exec(header)?.[1];
+  if (exceptionName !== undefined && new RegExp(`\\b(?:print|capture_exception|report_exception|record_exception|logger\\.(?:debug|info|warning|error|exception|critical))\\s*\\([^\\n]*\\b${escapeRegExp(exceptionName)}\\b`).test(handler)) {
+    return false;
+  }
+  if (/\blogger\.exception\s*\(|\bprint\s*\(|\bcapture_exception\s*\(|\breport_exception\s*\(|\brecord_exception\s*\(/.test(handler)) return false;
+  if (!/^\s*raise\b/m.test(handlerCode) && /^\s+(?:return\b[^\n]*|continue|break)\s*$/m.test(handlerCode)) {
+    if (exceptionName === undefined || !new RegExp(`\\b${escapeRegExp(exceptionName)}\\b`).test(handler.slice(handler.indexOf("\n") + 1))) return true;
+  }
+  if (/^\s*raise\s*$/m.test(handlerCode)) return false;
+  if (!/^\s*raise\s+[A-Za-z_]\w*\s*\(/m.test(handlerCode) || !/\bfrom\s+None\b/.test(handlerCode)) return false;
+  if (exceptionName !== undefined && new RegExp(`\\b(?:str\\s*\\(\\s*${escapeRegExp(exceptionName)}\\s*\\)|${escapeRegExp(exceptionName)}\\s*[},)])`).test(handler)) return false;
+  if (!/status_code/.test(handlerCode) || !/urlsplit|urlparse|\.path\b|split\s*\(|partition\s*\(/.test(handlerCode)) return false;
+  return true;
+}
+
+function maskPythonNonCode(source: string): string {
+  const chars = [...source];
+  let index = 0;
+  while (index < chars.length) {
+    const character = chars[index];
+    if (character === "#") {
+      while (index < chars.length && chars[index] !== "\n") {
+        chars[index] = " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (character !== '"' && character !== "'") {
+      index += 1;
+      continue;
+    }
+    const quote = character;
+    const triple = chars[index + 1] === quote && chars[index + 2] === quote;
+    const delimiterLength = triple ? 3 : 1;
+    for (let offset = 0; offset < delimiterLength; offset += 1) chars[index + offset] = " ";
+    index += delimiterLength;
+    while (index < chars.length) {
+      if (triple && chars[index] === quote && chars[index + 1] === quote && chars[index + 2] === quote) {
+        for (let offset = 0; offset < 3; offset += 1) chars[index + offset] = " ";
+        index += 3;
+        break;
+      }
+      if (!triple && chars[index] === quote) {
+        chars[index] = " ";
+        index += 1;
+        break;
+      }
+      if (chars[index] === "\\" && !triple) {
+        chars[index] = " ";
+        if (index + 1 < chars.length && chars[index + 1] !== "\n") chars[index + 1] = " ";
+        index += 2;
+        continue;
+      }
+      if (chars[index] !== "\n") chars[index] = " ";
+      index += 1;
+    }
+  }
+  return chars.join("");
+}
+
+function lineOffsets(source: string): number[] {
+  const offsets = [0];
+  for (let index = 0; index < source.length; index += 1) {
+    if (source[index] === "\n") offsets.push(index + 1);
+  }
+  return offsets;
+}
+
+function lineIndexAt(offsets: number[], sourceIndex: number): number {
+  let line = 0;
+  while (line + 1 < offsets.length && (offsets[line + 1] ?? 0) <= sourceIndex) line += 1;
+  return line;
+}
+
+function indentation(source: string): number {
+  return source.match(/^[\t ]*/)?.[0].length ?? 0;
+}
+
+function balancedSource(
+  source: string,
+  opening: number,
+  open: "(" | "{",
+  close: ")" | "}",
+): BalancedSource | undefined {
+  if (opening < 0 || source[opening] !== open) return undefined;
+  let depth = 0;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let index = opening; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote !== undefined) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === open) depth += 1;
+    else if (character === close) {
+      depth -= 1;
+      if (depth === 0) return { source: source.slice(opening, index + 1), end: index + 1 };
+    }
+  }
+  return undefined;
+}
+
+function findFunctionBlocks(source: string): FunctionBlock[] {
+  const blocks: FunctionBlock[] = [];
+  const executable = maskPythonNonCode(source);
+  const definition = /^(?<indent>[\t ]*)(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(/gm;
+  for (const match of executable.matchAll(definition)) {
+    if (match.index === undefined) continue;
+    const indent = match.groups?.indent?.length ?? 0;
+    const opening = executable.indexOf("(", match.index);
+    const signature = balancedSource(executable, opening, "(", ")");
+    if (signature === undefined) continue;
+    const signatureEnd = executable.indexOf("\n", signature.end);
+    if (signatureEnd < 0 || !executable.slice(signature.end, signatureEnd).includes(":")) continue;
+    const bodyStart = signatureEnd + 1;
+    if (bodyStart <= 0) continue;
+    let end = source.length;
+    let cursor = bodyStart;
+    while (cursor < source.length) {
+      const nextNewline = executable.indexOf("\n", cursor);
+      const lineEnd = nextNewline < 0 ? executable.length : nextNewline;
+      const line = executable.slice(cursor, lineEnd);
+      if (line.trim() !== "" && (line.match(/^[\t ]*/)?.[0].length ?? 0) <= indent) {
+        end = cursor;
+        break;
+      }
+      cursor = nextNewline < 0 ? source.length : nextNewline + 1;
+    }
+    blocks.push({
+      body: source.slice(bodyStart, end),
+      start: bodyStart,
+      signature: source.slice(match.index, signatureEnd),
+    });
+  }
+  return blocks;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function directFindingEligible(file: SourceFile, line: number): boolean {

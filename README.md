@@ -1,6 +1,6 @@
 # security/secrets
 
-**security/secrets** scans repository text for **high-confidence committed credentials and private keys**: AWS keys, GitHub PATs, cloud provider tokens, private key blocks, Stripe live keys, and similar material that should never land in git.
+**security/secrets** scans repository text for **committed credentials and private keys** and a small set of evidence-backed paths that expose credential values through logs or exceptions.
 
 It is a **secrets scanner**, not a general security review. It prefers silence on placeholders, examples, and false-positive-prone shapes. When it reports, rotate immediately.
 
@@ -26,6 +26,7 @@ Highlights:
 | Keys | OpenSSH / PEM private key blocks |
 | SaaS | Stripe live keys, Slack tokens, SendGrid, npm tokens |
 | Config | DB connection strings; committed dotenv with real secrets; K8s Secret manifests with data; known Symfony defaults |
+| Runtime exposure | Python Requests query credentials that escape through URL-bearing HTTP errors |
 
 ### Ownership boundaries
 
@@ -39,6 +40,6 @@ Other official adversaries own adjacent classes so findings stay non-duplicative
 
 ## Precision stance
 
-- **High confidence** pattern matches only; known false-positive shapes are filtered.
+- Committed-material rules use **high-confidence** patterns; runtime exposure requires a concrete credential source, Requests receiver, and disclosure sink.
 - Placeholders like `YOUR_API_KEY` / `xxx` should stay quiet.
 - Any true positive should trigger credential rotation, not a style debate.
