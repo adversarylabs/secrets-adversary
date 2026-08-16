@@ -1,45 +1,21 @@
-# security/secrets
+# Secrets adversary
 
-**security/secrets** scans repository text for **committed credentials and private keys** and a small set of evidence-backed paths that expose credential values through logs or exceptions.
+Scans repository text for committed credentials and narrow credential exposure paths.
 
-It is a **secrets scanner**, not a general security review. It prefers silence on placeholders, examples, and false-positive-prone shapes. When it reports, rotate immediately.
+## Goals
 
-## What it does
+The adversary is designed to produce a small number of high-confidence,
+actionable findings grounded in concrete repository evidence. Its review should
+be deterministic where possible, explicit about impact, and quiet when the
+available evidence does not justify a finding.
 
-1. **Scans** repository files with high-precision patterns (with false-positive filters).
-2. **Emits stable rule ids** with file:line evidence and credential class labels.
-3. **Synthesizes a review** focused on revoke/rotate guidance.
-4. Optionally **enhances** with a model when provided — prioritization only, not freestyle secret invention.
+## Scope
 
-It never executes the scanned project as the product under review, never installs dependencies into it, and never needs network access to the target repository.
+It evaluates repository text and narrow code paths for committed credentials, private keys, tokens, connection strings, secret manifests, and credential exposure through errors.
 
-## What it detects
+The complete detector or review inventory is maintained in
+[CHECKS.md](CHECKS.md).
 
-Every **shipped rule id**, severity, and short description lives in **[CHECKS.md](CHECKS.md)** — the audit surface for “what does this adversary look for?”
+## Boundaries
 
-Highlights:
-
-| Area | Examples |
-| --- | --- |
-| Cloud | AWS access key IDs and secret access keys |
-| Git forges | GitHub classic and fine-grained PATs |
-| Keys | OpenSSH / PEM private key blocks |
-| SaaS | Stripe live keys, Slack tokens, SendGrid, npm tokens |
-| Config | DB connection strings; committed dotenv with real secrets; K8s Secret manifests with data; known Symfony defaults |
-| Runtime exposure | Python Requests query credentials that escape through URL-bearing HTTP errors |
-
-### Ownership boundaries
-
-Other official adversaries own adjacent classes so findings stay non-duplicative:
-
-| Concern | Owned by |
-| --- | --- |
-| Secret *logging* / argv / URL patterns in Go source | [`go/security`](https://github.com/adversarylabs/go-security-adversary) |
-| Dockerfile ARG/ENV secret material | [`container/dockerfile`](https://github.com/adversarylabs/dockerfile-adversary) |
-| CI secret scope and script injection | [`ci/github-actions`](https://github.com/adversarylabs/githubactions-adversary) |
-
-## Precision stance
-
-- Committed-material rules use **high-confidence** patterns; runtime exposure requires a concrete credential source, Requests receiver, and disclosure sink.
-- Placeholders like `YOUR_API_KEY` / `xxx` should stay quiet.
-- Any true positive should trigger credential rotation, not a style debate.
+It stays within this domain, does not execute target code, and leaves unrelated concerns to the corresponding specialist adversaries.
