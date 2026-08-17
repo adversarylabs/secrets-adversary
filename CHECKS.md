@@ -1,177 +1,21 @@
-# Checks — what security/secrets detects
+# Checks
 
-This file is the **public audit list** of detectors. If a rule id appears here, it is part of the product surface: it should fire on a vulnerable pattern, stay quiet on the documented clean case, and produce file:line evidence where applicable.
-
-Runtime source of truth: [`src/spec.ts`](src/spec.ts) / [`src/rules.ts`](src/rules.ts).
-Regression entry: [`test/`](test/) including false-positive cases.
-
-**Scope:** repository text files (binary and well-known generated paths filtered).
-
----
-
-## Critical
-
-### `secrets.aws.access-key-id`
-
-| | |
-| --- | --- |
-| **What** | AWS access key ID in source |
-| **Why** | Account takeover / data exfil |
-| **Looks for** | `AKIA[0-9A-Z]{16}` shapes |
-| **Stays quiet when** | Examples/placeholders only |
-| **Remediation** | Disable key; rotate; use IAM roles / workload identity |
-
-### `secrets.aws.secret-access-key`
-
-| | |
-| --- | --- |
-| **What** | AWS secret access key |
-| **Why** | Pairs with access key ID for full API access |
-| **Looks for** | aws_secret_access_key / secretAccessKey assignments |
-| **Stays quiet when** | No raw secret material |
-| **Remediation** | Rotate immediately; secret manager only |
-
-### `secrets.github.pat`
-
-| | |
-| --- | --- |
-| **What** | GitHub classic personal access token |
-| **Why** | Repo and org access with user privileges |
-| **Looks for** | `ghp_` tokens |
-| **Stays quiet when** | Revoked/example tokens |
-| **Remediation** | Revoke in GitHub; prefer fine-grained or apps |
-
-### `secrets.github.fine-grained`
-
-| | |
-| --- | --- |
-| **What** | GitHub fine-grained PAT |
-| **Why** | Scoped but still privileged git access |
-| **Looks for** | github_pat_… shapes |
-| **Stays quiet when** | Examples only |
-| **Remediation** | Revoke and reissue from GitHub settings |
-
-### `secrets.ssh.private-key`
-
-| | |
-| --- | --- |
-| **What** | SSH private key block |
-| **Why** | Host and git auth material |
-| **Looks for** | BEGIN OPENSSH/RSA/EC PRIVATE KEY blocks |
-| **Stays quiet when** | Public keys only; keys outside repo |
-| **Remediation** | Revoke key; generate new; never commit private keys |
-
-### `secrets.private-key.openssh`
-
-| | |
-| --- | --- |
-| **What** | OpenSSH private key material |
-| **Why** | Same class as SSH private keys |
-| **Looks for** | OpenSSH private key armor |
-| **Stays quiet when** | Public keys / certificates only |
-| **Remediation** | Rotate and remove from history if pushed |
-
-### `secrets.stripe.live-key`
-
-| | |
-| --- | --- |
-| **What** | Stripe live secret key |
-| **Why** | Payment API access |
-| **Looks for** | `sk_live_` keys |
-| **Stays quiet when** | test keys in non-prod with care; never live in git |
-| **Remediation** | Roll key in Stripe dashboard |
-
-### `secrets.slack.token`
-
-| | |
-| --- | --- |
-| **What** | Slack token |
-| **Why** | Workspace API access |
-| **Looks for** | xox*-shaped tokens |
-| **Stays quiet when** | Placeholders |
-| **Remediation** | Revoke in Slack; use env injection |
-
-### `secrets.sendgrid.api-key`
-
-| | |
-| --- | --- |
-| **What** | SendGrid API key |
-| **Why** | Email send abuse |
-| **Looks for** | SG. API key shapes |
-| **Stays quiet when** | Examples |
-| **Remediation** | Rotate in SendGrid |
-
-### `secrets.npm.token`
-
-| | |
-| --- | --- |
-| **What** | npm access token |
-| **Why** | Package publish / download abuse |
-| **Looks for** | npm_ tokens |
-| **Stays quiet when** | CI secrets store |
-| **Remediation** | Revoke on npmjs.com |
-
-### `secrets.ai.provider-key`
-
-| | |
-| --- | --- |
-| **What** | AI provider API key |
-| **Why** | Billable model API access |
-| **Looks for** | Provider-specific live key shapes |
-| **Stays quiet when** | Placeholders |
-| **Remediation** | Rotate at the provider |
-
-### `secrets.db.connection-string`
-
-| | |
-| --- | --- |
-| **What** | Database connection string with credentials |
-| **Why** | Direct DB access |
-| **Looks for** | URL DSNs with embedded passwords |
-| **Stays quiet when** | Passwordless local sockets / secret managers |
-| **Remediation** | Move credentials to a secret store |
-
-## High
-
-### `secrets.symfony.default-secret`
-
-| | |
-| --- | --- |
-| **What** | Known Symfony or eZ Platform default application secret |
-| **Why** | Public defaults remain usable signing material when deployments never replace them |
-| **Looks for** | Exact legacy `ThisTokenIsNotSoSecretChangeIt` and eZ Platform variant values |
-| **Stays quiet when** | Generic placeholders or deployment-specific generated values are used |
-| **Public examples** | [Trivy maintainer review](https://github.com/aquasecurity/trivy/pull/9892#discussion_r2597664195) |
-| **Remediation** | Generate a new high-entropy secret outside version control and invalidate artifacts signed with the old value |
-
-### `secrets.dotenv.committed`
-
-| | |
-| --- | --- |
-| **What** | Committed dotenv with real secret material |
-| **Why** | Env files often hold production secrets |
-| **Looks for** | .env* with high-entropy assignments |
-| **Stays quiet when** | Example `.env.example` without real secrets |
-| **Remediation** | Untrack; rotate; use secret manager |
-
-### `secrets.k8s.secret-manifest`
-
-| | |
-| --- | --- |
-| **What** | Kubernetes Secret manifest with data |
-| **Why** | Base64 is not encryption |
-| **Looks for** | Secret manifests containing data/stringData |
-| **Stays quiet when** | External secrets / sealed secrets |
-| **Remediation** | Do not commit raw Secret data |
-
-## Medium
-
-### `secrets.query-credential-http-error`
-
-| | |
-| --- | --- |
-| **What** | Python Requests code puts a credential-bearing value in `params=` and lets `raise_for_status()` expose the prepared URL through an escaping HTTP error |
-| **Why** | Requests includes the prepared URL, including its query string, in the HTTP error text; exception reporting can therefore disclose the credential |
-| **Looks for** | A secret-like key or value in a Requests query mapping, the bound request call, and `raise_for_status()` on that response in the same function |
-| **Stays quiet when** | Query values are ordinary filters or pagination state; credentials use headers or `auth=`; no URL-bearing error is raised; or a local handler emits a sanitized status/path-only error without exception chaining |
-| **Remediation** | Preserve the status and request path in a sanitized error while omitting the query string and original URL-bearing exception text |
+| Rule | Severity | Scans for |
+| --- | --- | --- |
+| `secrets.ai.provider-key` | Critical | AI provider API key |
+| `secrets.aws-key` | Critical | Repository contains an AWS access key identifier |
+| `secrets.aws.access-key-id` | Critical | AWS access key ID in source |
+| `secrets.aws.secret-access-key` | Critical | AWS secret access key |
+| `secrets.db.connection-string` | Critical | Database connection string with credentials |
+| `secrets.dotenv.committed` | High | Committed dotenv with real secret material |
+| `secrets.github.fine-grained` | Critical | GitHub fine-grained PAT |
+| `secrets.github.pat` | Critical | GitHub classic personal access token |
+| `secrets.k8s.secret-manifest` | High | Kubernetes Secret manifest with data |
+| `secrets.npm.token` | Critical | npm access token |
+| `secrets.private-key.openssh` | Critical | OpenSSH private key material |
+| `secrets.query-credential-http-error` | Medium | Python Requests code puts a credential-bearing value in `params=` and lets `raise_for_status()` expose the prepared URL through an escaping HTTP error |
+| `secrets.sendgrid.api-key` | Critical | SendGrid API key |
+| `secrets.slack.token` | Critical | Slack token |
+| `secrets.ssh.private-key` | Critical | SSH private key block |
+| `secrets.stripe.live-key` | Critical | Stripe live secret key |
+| `secrets.symfony.default-secret` | High | Known Symfony or eZ Platform default application secret |
