@@ -1,5 +1,5 @@
 name: security/secrets
-version: 0.0.16
+version: 0.0.17
 description: Scans repository text for committed credentials and narrow credential exposure paths.
 
 triggers:
