@@ -1,5 +1,5 @@
 name: adversarylabs/security/secrets
-version: 0.0.17
+version: 0.0.18
 description: Scans repository text for committed credentials and narrow credential exposure paths.
 
 triggers:
