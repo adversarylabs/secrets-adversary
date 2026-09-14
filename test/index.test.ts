@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -444,7 +444,7 @@ test("deterministic envelope", async () => {
     assert.deepEqual(second, first);
     const envelope = JSON.parse(JSON.stringify(createAdversaryRunEnvelope(first)));
     assert.equal(envelope.protocolVersion, 1);
-    assert.equal(envelope.result.adversary.version, "0.0.18");
+    assert.equal(envelope.result.adversary.version, (JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
   });
 });
 
